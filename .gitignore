@@ -1,0 +1,38 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+[Dd]ebug/
+[Rr]elease/
+*.dll
+*.pdb
+project.lock.json
+artifacts/
+
+## 配置与密钥（重要：绝不提交）
+appsettings.Development.json
+appsettings.Local.json
+.env
+*.env.local
+secrets.json
+
+## IDE
+.idea/
+.vscode/
+*.swp
+
+## 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## 模型与数据（体积大，不进仓库）
+*.gguf
+*.onnx
+*.safetensors
+/models/
+/data/
+*.db
+*.sqlite
