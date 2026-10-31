@@ -36,4 +36,3 @@ desktop.ini
 /data/
 *.db
 *.sqlite
-/projects/HelloLlm/appsettings.json
