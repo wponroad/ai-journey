@@ -1,5 +1,4 @@
 ﻿using SharpToken;
-using Xunit;
 
 var encoding = GptEncoding.GetEncoding("cl100k_base");
 var encoded = encoding.Encode("Hello, world!");
