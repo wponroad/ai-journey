@@ -48,23 +48,63 @@ using (IChatClient chat = new OpenAIClient(
     Console.WriteLine($"配置节   {modelType}");
     Console.WriteLine($"模型     {options.Model}");
     Console.WriteLine($"地址     {options.BaseUrl}");
-    Console.WriteLine(new string('-', 60));
-
+    Console.WriteLine(new string('=', 60));
+    //想测「关掉思考」的对比，把question 值改成 "/no_think 用一句话介绍你自己。"
     var question = "用一句话介绍你自己。";
+    
+
+    // ───────── 1. 非流式：全部生成完才返回 ─────────
+    Console.WriteLine("【非流式】");
     Console.WriteLine($"你 > {question}");
 
     var reply = await llm.AskAsync(question);
 
-    Console.WriteLine();
     Console.WriteLine($"AI > {reply.Text}");
-    Console.WriteLine(new string('-', 60));
-    Console.WriteLine($"耗时 {reply.ElapsedMs} ms");
-    Console.WriteLine($"InputTokens {reply.InputTokens}");
-    Console.WriteLine($"OutTokens {reply.OutputTokens}");
-    Console.WriteLine($"ModelType {reply.ModelType}");
-    Console.WriteLine($"ModeUrl {reply.ModeUrl}");
-    Console.WriteLine($"ModeId {reply.ModeId}");
+    Console.WriteLine($"耗时 {reply.ElapsedMs} ms | token 输入 {reply.InputTokens} / 输出 {reply.OutputTokens}");
+    Console.WriteLine($"provider {reply.ModelType} | 模型 {reply.ModeId}");
+    Console.WriteLine(new string('=', 60));
 
-    if (reply.InputTokens is not null)
-        Console.WriteLine($"token    输入 {reply.InputTokens} / 输出 {reply.OutputTokens}");
+    // ───────── 2. 流式：来一片打一片 ─────────
+    Console.WriteLine("【流式】");
+    Console.WriteLine($"你 > {question}");
+    Console.Write("AI > ");
+
+    long? ttft = null;          // 第一片到达（可能还是思考内容）
+    long? firstAnswer = null;   // 第一段正文到达
+    long total = 0;
+    long? inTok = null;
+    long? outTok = null;
+
+    await foreach (LlmChunk chunk in llm.AskStreamAsync(question))
+    {
+        if (chunk.IsFinal)
+        {
+            total = chunk.ElapsedMs;
+            inTok = chunk.InputTokens;
+            outTok = chunk.OutputTokens;
+            break;
+        }
+
+        ttft ??= chunk.ElapsedMs;
+        if (!chunk.IsReasoning)
+            firstAnswer ??= chunk.ElapsedMs;
+
+        if (chunk.IsReasoning)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.Write(chunk.Text);
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.Write(chunk.Text);
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine(new string('=', 60));
+    Console.WriteLine($"TTFT 第一片到达     {ttft} ms");
+    Console.WriteLine($"正文首字            {firstAnswer} ms");
+    Console.WriteLine($"总耗时              {total} ms");
+    Console.WriteLine($"token               输入 {inTok} / 输出 {outTok}");
 }
