@@ -12,10 +12,20 @@ namespace HelloLlm
             _chatClient = chatClient;
         }
 
-        public async Task<LlmReply> AskAsync(string question)
+        public async Task<LlmReply> AskAsync(string question, LlmSettings settings = null)
         {
             var sw = Stopwatch.StartNew();
-            var response = await _chatClient.GetResponseAsync(question);
+            ChatOptions? options = null;
+            if (settings != null)
+            {
+                options = new ChatOptions
+                {
+                    Temperature = settings.Temperature,
+                    TopP = settings.TopP,
+                    MaxOutputTokens = settings.MaxTokens
+                };
+            }
+            var response = await _chatClient.GetResponseAsync(question, options);
             sw.Stop();
             var modelInfo = _chatClient.GetService<ChatClientMetadata>();
             return new LlmReply
