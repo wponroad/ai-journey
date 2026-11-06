@@ -1,4 +1,4 @@
-namespace HelloLlm
+﻿namespace HelloLlm
 {
     public sealed class LlmReply
     {
@@ -30,5 +30,11 @@ namespace HelloLlm
         /// 大模型的Id
         /// </summary>
         public string? ModeId { get; init; }
+        /// <summary>
+        /// 本次调用的金额（元）。用 decimal 而不是 float：
+        /// 金额一旦参与累加，二进制浮点的误差会累积成真实的对不上账。
+        /// 为 null 表示没算（没拿到用量统计，或者这个配置节没有配价格）。
+        /// </summary>
+        public decimal? Amount { get; init; }
     }
 }

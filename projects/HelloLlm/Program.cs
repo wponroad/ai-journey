@@ -37,79 +37,51 @@ if (string.IsNullOrWhiteSpace(options.ApiKey))
     return;
 }
 
+// 计价永远用云端价：调云端时它就是实际成本；
+// 调本地时算出来的，是「这一次如果走云端要花多少」，也就是本地省下的钱。
+var pricing = config.GetSection("CloudModel").Get<ModelOptions>();
+CostCalculator? cost = pricing is null ? null : new CostCalculator(pricing);
+bool isLocal = modelType == "LocalModel";
+
 using (IChatClient chat = new OpenAIClient(
        new ApiKeyCredential(options.ApiKey),
        new OpenAIClientOptions { Endpoint = new Uri(options.BaseUrl) })
    .GetChatClient(options.Model)
    .AsIChatClient())
 {
-    ILLMService llm = new LlmService(chat);
+    ILLMService llm = new LlmService(chat, cost);
 
     Console.WriteLine($"配置节   {modelType}");
     Console.WriteLine($"模型     {options.Model}");
     Console.WriteLine($"地址     {options.BaseUrl}");
+    if (cost is not null && pricing is not null)
+    {
+        bool peak = cost.IsPeakTime(DateTime.Now);
+        Console.WriteLine($"计价     {(peak ? "高峰 · 原价" : $"空闲 · {pricing.Discount:0.##} 折")}");
+    }
     Console.WriteLine(new string('=', 60));
-    //想测「关掉思考」的对比，把question 值改成 "/no_think 用一句话介绍你自己。"
+
     var question = "/no_think先用一句话介绍你自己，你是本地模型还是云端模型？再做一个简要的说明你能帮助我做什么事情。";
 
+    // ───────── 1. 非流式 ─────────
+    Console.WriteLine("【非流式】");
     Console.WriteLine($"你 > {question}");
-    // ───────── 1. 非流式：全部生成完才返回 ─────────
-    List<float> temperatures = new List<float> { 0f, 0.7f, 1f, 1.5f };
-    List<float> topPs = new List<float> { 0.01f, 0.1f, 0.5f, 1f };
-    List<int> maxTokens = new List<int> { 20, 100, 500 };
-    foreach (var item in temperatures)
-    {
-        Console.WriteLine($"【非流式】Temperature {item}");
-        LlmSettings settings = new LlmSettings
-        {
-            Temperature = item
-        };
-        var reply = await llm.AskAsync(question, settings);
-        Console.WriteLine($"AI > {reply.Text}");
-        Console.WriteLine($"耗时 {reply.ElapsedMs} ms | token 输入 {reply.InputTokens} / 输出 {reply.OutputTokens}");
-        Console.WriteLine($"provider {reply.ModelType} | 模型 {reply.ModeId}");
-        Console.WriteLine(new string('=', 60));
-    }
-    for (int i = 0; i < 5; i++)
-    {
-        foreach (var item in topPs)
-        {
-            Console.WriteLine($"【非流式】TopP {item}");
-            LlmSettings settings = new LlmSettings
-            {
-                Temperature = 0.7f,
-                TopP = item
-            };
-            var reply = await llm.AskAsync(question, settings);
-            Console.WriteLine($"AI > {reply.Text}");
-            Console.WriteLine($"耗时 {reply.ElapsedMs} ms | token 输入 {reply.InputTokens} / 输出 {reply.OutputTokens}");
-            Console.WriteLine($"provider {reply.ModelType} | 模型 {reply.ModeId}");
-            Console.WriteLine(new string('=', 60));
-        }
-    }
-    foreach (var item in maxTokens)
-    {
-        Console.WriteLine($"【非流式】MaxTokens {item}");
-        LlmSettings settings = new LlmSettings
-        {
-            MaxTokens = item
-        };
-        var reply = await llm.AskAsync(question, settings);
-        Console.WriteLine($"AI > {reply.Text}");
-        Console.WriteLine($"耗时 {reply.ElapsedMs} ms | token 输入 {reply.InputTokens} / 输出 {reply.OutputTokens}");
-        Console.WriteLine($"provider {reply.ModelType} | 模型 {reply.ModeId}");
-        Console.WriteLine(new string('=', 60));
-    }
-    // ───────── 2. 流式：来一片打一片 ─────────
+
+    var reply = await llm.AskAsync(question);
+    PrintReply(reply);
+    PrintCostLine(reply.Amount);
+
+    // ───────── 2. 流式 ─────────
     Console.WriteLine("【流式】");
     Console.WriteLine($"你 > {question}");
     Console.Write("AI > ");
 
-    long? ttft = null;          // 第一片到达（可能还是思考内容）
-    long? firstAnswer = null;   // 第一段正文到达
+    long? ttft = null;
+    long? firstAnswer = null;
     long total = 0;
     long? inTok = null;
     long? outTok = null;
+    decimal? streamAmount = null;
 
     await foreach (LlmChunk chunk in llm.AskStreamAsync(question))
     {
@@ -118,6 +90,7 @@ using (IChatClient chat = new OpenAIClient(
             total = chunk.ElapsedMs;
             inTok = chunk.InputTokens;
             outTok = chunk.OutputTokens;
+            streamAmount = chunk.Amount;
             break;
         }
 
@@ -143,4 +116,28 @@ using (IChatClient chat = new OpenAIClient(
     Console.WriteLine($"正文首字            {firstAnswer} ms");
     Console.WriteLine($"总耗时              {total} ms");
     Console.WriteLine($"token               输入 {inTok} / 输出 {outTok}");
+    PrintCostLine(streamAmount);
+}
+
+// ───────── 输出辅助（顶层语句里的局部函数） ─────────
+
+void PrintReply(LlmReply r)
+{
+    Console.WriteLine($"AI > {r.Text}");
+    Console.WriteLine($"耗时 {r.ElapsedMs} ms | token 输入 {r.InputTokens} / 输出 {r.OutputTokens}");
+    Console.WriteLine($"provider {r.ModelType} | 模型 {r.ModeId}");
+}
+
+void PrintCostLine(decimal? amount)
+{
+    if (amount is null)
+    {
+        Console.WriteLine("金额     未计算（没拿到用量统计，或者这个配置没配价格）");
+        return;
+    }
+
+    // 金额小到小数点后三四位才看得见，用固定 6 位小数，再折算成「分」
+    string money = $"{amount.Value:F6} 元（{amount.Value * 100:F4} 分）";
+    Console.WriteLine(isLocal ? $"金额     本地实际 0 元 | 等价云端 {money}" : $"金额     {money}");
+    Console.WriteLine(new string('=', 60));
 }

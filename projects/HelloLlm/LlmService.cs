@@ -7,9 +7,16 @@ namespace HelloLlm
     public sealed class LlmService : ILLMService
     {
         private readonly IChatClient _chatClient;
-        public LlmService(IChatClient chatClient)
+        private readonly CostCalculator? _cost;
+
+        /// <summary>
+        /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
+        /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
+        /// </summary>
+        public LlmService(IChatClient chatClient, CostCalculator? cost = null)
         {
             _chatClient = chatClient;
+            _cost = cost;
         }
 
         public async Task<LlmReply> AskAsync(string question, LlmSettings settings = null)
@@ -28,16 +35,33 @@ namespace HelloLlm
             var response = await _chatClient.GetResponseAsync(question, options);
             sw.Stop();
             var modelInfo = _chatClient.GetService<ChatClientMetadata>();
+
+            long? input = response.Usage?.InputTokenCount;
+            long? output = response.Usage?.OutputTokenCount;
+
             return new LlmReply
             {
                 Text = response.Text ?? "",
-                InputTokens = response.Usage?.InputTokenCount,
-                OutputTokens = response.Usage?.OutputTokenCount,
+                InputTokens = input,
+                OutputTokens = output,
+                Amount = CalcAmount(input, output),
                 ElapsedMs = sw.ElapsedMilliseconds,
                 ModelType = modelInfo?.ProviderName,
                 ModeUrl = modelInfo?.ProviderUri?.AbsoluteUri,
                 ModeId = modelInfo?.DefaultModelId
             };
+        }
+
+        /// <summary>
+        /// 算钱。三个条件缺一不可：有计算器、有输入数、有输出数。
+        /// 任何一个缺了就返回 null —— 返回 0 会被误读成「这次免费」。
+        /// </summary>
+        private decimal? CalcAmount(long? input, long? output)
+        {
+            if (_cost is null || input is null || output is null)
+                return null;
+
+            return _cost.Calculate(input.Value, output.Value);
         }
         public async IAsyncEnumerable<LlmChunk> AskStreamAsync(string question, [EnumeratorCancellation] CancellationToken ct = default)
         {
@@ -85,7 +109,8 @@ namespace HelloLlm
                 IsFinal = true,
                 ElapsedMs = sw.ElapsedMilliseconds,
                 InputTokens = input,
-                OutputTokens = output
+                OutputTokens = output,
+                Amount = CalcAmount(input, output)
             };
         }
     }
