@@ -15,6 +15,11 @@
         /// </summary>
         public long? OutputTokens { get; init; }
         /// <summary>
+        /// 输入里命中提示词缓存的 token 数。缓存单价远低于未命中，算钱必须把两者拆开。
+        /// 为 null 表示 provider 没给这个字段。
+        /// </summary>
+        public long? CachedInputTokens { get; init; }
+        /// <summary>
         /// 本地调用的耗时
         /// </summary>
         public long ElapsedMs { get; init; }

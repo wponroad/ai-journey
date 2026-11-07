@@ -1,9 +1,14 @@
-﻿using System.Diagnostics;
+﻿using Microsoft.Extensions.AI;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using Microsoft.Extensions.AI;
 
 namespace HelloLlm
 {
+    /// <summary>
+    /// LLM 调用的唯一入口。
+    /// 这个类里可以出现 SDK 类型（ChatMessage / ChatOptions / ChatResponse），
+    /// 但它的公开签名里一个都不能有 —— 那是它存在的意义。
+    /// </summary>
     public sealed class LlmService : ILLMService
     {
         private readonly IChatClient _chatClient;
@@ -19,64 +24,42 @@ namespace HelloLlm
             _cost = cost;
         }
 
-        public async Task<LlmReply> AskAsync(string question, LlmSettings settings = null)
+        // ───────── 非流式 ─────────
+
+        public Task<LlmReply> AskAsync(string question, LlmSettings? settings = null)
+            => AskAsync(AsMessages(question), settings);
+
+        public async Task<LlmReply> AskAsync(IList<LlmMessage> messages, LlmSettings? settings = null)
         {
             var sw = Stopwatch.StartNew();
-            ChatOptions? options = null;
-            if (settings != null)
-            {
-                options = new ChatOptions
-                {
-                    Temperature = settings.Temperature,
-                    TopP = settings.TopP,
-                    MaxOutputTokens = settings.MaxTokens
-                };
-            }
-            var response = await _chatClient.GetResponseAsync(question, options);
+            var response = await _chatClient.GetResponseAsync(ToChatMessages(messages), BuildOptions(settings));
             sw.Stop();
-            var modelInfo = _chatClient.GetService<ChatClientMetadata>();
 
-            long? input = response.Usage?.InputTokenCount;
-            long? output = response.Usage?.OutputTokenCount;
-
-            return new LlmReply
-            {
-                Text = response.Text ?? "",
-                InputTokens = input,
-                OutputTokens = output,
-                Amount = CalcAmount(input, output),
-                ElapsedMs = sw.ElapsedMilliseconds,
-                ModelType = modelInfo?.ProviderName,
-                ModeUrl = modelInfo?.ProviderUri?.AbsoluteUri,
-                ModeId = modelInfo?.DefaultModelId
-            };
+            return ToReply(response, sw.ElapsedMilliseconds);
         }
 
-        /// <summary>
-        /// 算钱。三个条件缺一不可：有计算器、有输入数、有输出数。
-        /// 任何一个缺了就返回 null —— 返回 0 会被误读成「这次免费」。
-        /// </summary>
-        private decimal? CalcAmount(long? input, long? output)
-        {
-            if (_cost is null || input is null || output is null)
-                return null;
+        // ───────── 流式 ─────────
 
-            return _cost.Calculate(input.Value, output.Value);
-        }
-        public async IAsyncEnumerable<LlmChunk> AskStreamAsync(string question, [EnumeratorCancellation] CancellationToken ct = default)
+        public IAsyncEnumerable<LlmChunk> AskStreamAsync(string question, CancellationToken ct = default)
+            => AskStreamAsync(AsMessages(question), null, ct);
+
+        public async IAsyncEnumerable<LlmChunk> AskStreamAsync(IList<LlmMessage> messages,
+                                                               LlmSettings? settings = null,
+                                                               [EnumeratorCancellation] CancellationToken ct = default)
         {
             var sw = Stopwatch.StartNew();
             long? input = null;
             long? output = null;
+            long? cachedInput = null;
 
             await foreach (ChatResponseUpdate update in
-                _chatClient.GetStreamingResponseAsync(question, cancellationToken: ct))
+                _chatClient.GetStreamingResponseAsync(ToChatMessages(messages), BuildOptions(settings), cancellationToken: ct))
             {
                 foreach (AIContent content in update.Contents)
                 {
                     switch (content)
                     {
-                        // 思考过程（qwen3 默认开思考，会先吐一大段）
+                        // 思考过程（推理模型才有，qwen3 默认开，DeepSeek 也会回传）
                         case TextReasoningContent reasoning when !string.IsNullOrEmpty(reasoning.Text):
                             yield return new LlmChunk
                             {
@@ -95,23 +78,98 @@ namespace HelloLlm
                             };
                             break;
 
-                        // 用量统计：流式下它不是单独的属性，也是当成一片 content 塞进来的，
-                        // 通常在最后。有的 provider 压根不给。
+                        // 用量统计：流式下不是单独的属性，也是当成一片 content 塞进来的
                         case UsageContent usageContent when usageContent.Details is { } details:
                             input = details.InputTokenCount;
                             output = details.OutputTokenCount;
+                            cachedInput = details.CachedInputTokenCount;
                             break;
                     }
                 }
             }
+
+            // 收尾片：文本为空，只带统计。调用方靠 IsFinal 判断「真的结束了」
             yield return new LlmChunk
             {
                 IsFinal = true,
                 ElapsedMs = sw.ElapsedMilliseconds,
                 InputTokens = input,
                 OutputTokens = output,
-                Amount = CalcAmount(input, output)
+                CachedInputTokens = cachedInput,
+                Amount = CalcAmount(input, output, cachedInput)
             };
+        }
+
+        // ───────── 翻译（这个类存在的唯一理由） ─────────
+
+        /// <summary>单句提问包成一条 User 消息，避免两个重载各写一遍。</summary>
+        private static List<LlmMessage> AsMessages(string question)
+            => [new LlmMessage { Role = LlmRole.User, Content = question }];
+
+        /// <summary>自己的消息类型 → SDK 的消息类型。这是业务层和 SDK 之间唯一的桥。</summary>
+        private static List<ChatMessage> ToChatMessages(IList<LlmMessage> messages)
+        {
+            var result = new List<ChatMessage>(messages.Count);
+            foreach (var m in messages)
+                result.Add(new ChatMessage(ToChatRole(m.Role), m.Content));
+            return result;
+        }
+
+        private static ChatRole ToChatRole(LlmRole role) => role switch
+        {
+            LlmRole.System => ChatRole.System,
+            LlmRole.Assistant => ChatRole.Assistant,
+            _ => ChatRole.User,
+        };
+
+        /// <summary>
+        /// settings 为 null 时必须返回 null，不能返回 new ChatOptions()。
+        /// 空的 ChatOptions 会把服务端默认值覆盖成一堆 null。
+        /// </summary>
+        private static ChatOptions? BuildOptions(LlmSettings? settings)
+        {
+            if (settings is null) return null;
+
+            return new ChatOptions
+            {
+                Temperature = settings.Temperature,
+                TopP = settings.TopP,
+                MaxOutputTokens = settings.MaxTokens
+            };
+        }
+
+        private LlmReply ToReply(ChatResponse response, long elapsedMs)
+        {
+            var modelInfo = _chatClient.GetService<ChatClientMetadata>();
+            long? input = response.Usage?.InputTokenCount;
+            long? output = response.Usage?.OutputTokenCount;
+            long? cachedInput = response.Usage?.CachedInputTokenCount;
+
+            return new LlmReply
+            {
+                Text = response.Text ?? "",
+                InputTokens = input,
+                OutputTokens = output,
+                CachedInputTokens = cachedInput,
+                Amount = CalcAmount(input, output, cachedInput),
+                ElapsedMs = elapsedMs,
+                ModelType = modelInfo?.ProviderName,
+                ModeUrl = modelInfo?.ProviderUri?.AbsoluteUri,
+                ModeId = modelInfo?.DefaultModelId
+            };
+        }
+
+        /// <summary>
+        /// 算钱。三个条件缺一不可：有计算器、有输入数、有输出数。
+        /// 任何一个缺了就返回 null —— 返回 0 会被误读成「这次免费」。
+        /// cachedInput 缺失时按 0 传，结果是保守的高估（缓存比未命中便宜得多）。
+        /// </summary>
+        private decimal? CalcAmount(long? input, long? output, long? cachedInput = null)
+        {
+            if (_cost is null || input is null || output is null)
+                return null;
+
+            return _cost.Calculate(input.Value, output.Value, cachedInput ?? 0);
         }
     }
 }

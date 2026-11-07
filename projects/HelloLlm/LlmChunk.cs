@@ -38,6 +38,11 @@
         public long? OutputTokens { get; init; }
 
         /// <summary>
+        /// 输入里命中提示词缓存的 token 数。只有 IsFinal 片上有值。
+        /// </summary>
+        public long? CachedInputTokens { get; init; }
+
+        /// <summary>
         /// 本次调用的金额（元）。只有 IsFinal 片上有值。
         /// </summary>
         public decimal? Amount { get; init; }

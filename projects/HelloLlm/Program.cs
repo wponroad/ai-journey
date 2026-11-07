@@ -61,83 +61,104 @@ using (IChatClient chat = new OpenAIClient(
     }
     Console.WriteLine(new string('=', 60));
 
-    var question = "/no_think先用一句话介绍你自己，你是本地模型还是云端模型？再做一个简要的说明你能帮助我做什么事情。";
+    // ───────── 人设：属于产品设定，所以放在调用方，不写死在 service 里 ─────────
+    Console.WriteLine("定义我的人设（直接回车用默认）：");
+    var systemPrompt = Console.ReadLine();
+    if (string.IsNullOrWhiteSpace(systemPrompt))
+        systemPrompt = "你是我部署在本地的 AI 助手，协助我学习 AI 知识、处理工作文件。被问到部署位置时，如实回答你在本地运行。";
 
-    // ───────── 1. 非流式 ─────────
-    Console.WriteLine("【非流式】");
-    Console.WriteLine($"你 > {question}");
-
-    var reply = await llm.AskAsync(question);
-    PrintReply(reply);
-    PrintCostLine(reply.Amount);
-
-    // ───────── 2. 流式 ─────────
-    Console.WriteLine("【流式】");
-    Console.WriteLine($"你 > {question}");
-    Console.Write("AI > ");
-
-    long? ttft = null;
-    long? firstAnswer = null;
-    long total = 0;
-    long? inTok = null;
-    long? outTok = null;
-    decimal? streamAmount = null;
-
-    await foreach (LlmChunk chunk in llm.AskStreamAsync(question))
+    // 历史从一条 System 消息开始，之后每轮往后追加
+    var history = new List<LlmMessage>
     {
-        if (chunk.IsFinal)
-        {
-            total = chunk.ElapsedMs;
-            inTok = chunk.InputTokens;
-            outTok = chunk.OutputTokens;
-            streamAmount = chunk.Amount;
-            break;
-        }
+        new() { Role = LlmRole.System, Content = systemPrompt.Trim() }
+    };
 
-        ttft ??= chunk.ElapsedMs;
-        if (!chunk.IsReasoning)
+    decimal total = 0m;
+    int round = 0;
+
+    Console.WriteLine(new string('=', 60));
+    Console.WriteLine("输入 exit 退出");
+
+    while (true)
+    {
+        Console.Write("\n你 > ");
+        var input = Console.ReadLine();
+
+        if (string.IsNullOrWhiteSpace(input)) continue;
+        if (input.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
+
+        history.Add(new LlmMessage { Role = LlmRole.User, Content = input.Trim() });
+        round++;
+
+        Console.Write("AI > ");
+
+        long? ttft = null;
+        long? firstAnswer = null;
+        long? inTok = null;
+        long? outTok = null;
+        long? cachedTok = null;
+        decimal? amount = null;
+        long totalMs = 0;
+        bool reasoningTag = false;
+        var answer = new StringBuilder();
+
+        await foreach (LlmChunk chunk in llm.AskStreamAsync(history))
+        {
+            if (chunk.IsFinal)
+            {
+                totalMs = chunk.ElapsedMs;
+                inTok = chunk.InputTokens;
+                outTok = chunk.OutputTokens;
+                cachedTok = chunk.CachedInputTokens;
+                amount = chunk.Amount;
+                break;
+            }
+
+            ttft ??= chunk.ElapsedMs;
+
+            if (chunk.IsReasoning)
+            {
+                // 思考内容不进正文，只提示一次「它在想」。
+                // 想看完整思考过程的话，把下面的 continue 换成打印 chunk.Text。
+                if (!reasoningTag)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write("[思考中…] ");
+                    Console.ResetColor();
+                    reasoningTag = true;
+                }
+                continue;
+            }
+
             firstAnswer ??= chunk.ElapsedMs;
+            Console.Write(chunk.Text);
+            answer.Append(chunk.Text);
+        }
 
-        if (chunk.IsReasoning)
-        {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.Write(chunk.Text);
-            Console.ResetColor();
-        }
-        else
-        {
-            Console.Write(chunk.Text);
-        }
+        Console.WriteLine();
+
+        // 模型的回答必须进历史，否则下一轮它不知道自己刚说过什么
+        history.Add(new LlmMessage { Role = LlmRole.Assistant, Content = answer.ToString() });
+
+        if (amount is not null) total += amount.Value;
+
+        Console.WriteLine(new string('-', 60));
+        Console.WriteLine($"第 {round} 轮 | 输入 {inTok}（缓存命中 {cachedTok}）/ 输出 {outTok} token | 历史 {history.Count} 条");
+        Console.WriteLine($"TTFT {ttft}ms | 正文首字 {firstAnswer}ms | 总耗时 {totalMs}ms");
+        Console.WriteLine($"本轮 {Money(amount)} | 累计 {Money(total)}");
     }
 
     Console.WriteLine();
     Console.WriteLine(new string('=', 60));
-    Console.WriteLine($"TTFT 第一片到达     {ttft} ms");
-    Console.WriteLine($"正文首字            {firstAnswer} ms");
-    Console.WriteLine($"总耗时              {total} ms");
-    Console.WriteLine($"token               输入 {inTok} / 输出 {outTok}");
-    PrintCostLine(streamAmount);
+    Console.WriteLine($"共 {round} 轮 | {(isLocal ? "本地实际 0 元，等价云端 " : "总计 ")}{total:F6} 元");
 }
 
 // ───────── 输出辅助（顶层语句里的局部函数） ─────────
 
-void PrintReply(LlmReply r)
+string Money(decimal? amount)
 {
-    Console.WriteLine($"AI > {r.Text}");
-    Console.WriteLine($"耗时 {r.ElapsedMs} ms | token 输入 {r.InputTokens} / 输出 {r.OutputTokens}");
-    Console.WriteLine($"provider {r.ModelType} | 模型 {r.ModeId}");
-}
+    if (amount is null) return "未计算（没拿到用量统计）";
 
-void PrintCostLine(decimal? amount)
-{
-    if (amount is null)
-    {
-        Console.WriteLine("金额     未计算（没拿到用量统计，或者这个配置没配价格）");
-        return;
-    }
-
-    // 金额小到小数点后三四位才看得见，用固定 6 位小数，再折算成「分」
     string money = $"{amount.Value:F6} 元（{amount.Value * 100:F4} 分）";
-    Console.WriteLine(isLocal ? $"金额     本地实际 0 元 | 等价云端 {money}" : $"金额     {money}");
-    Console.WriteLine(new string('=', 60));
+    return isLocal ? $"等价云端 {money}" : money;
 }
