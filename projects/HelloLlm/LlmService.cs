@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.AI;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace HelloLlm
 {
@@ -134,7 +135,15 @@ namespace HelloLlm
             {
                 Temperature = settings.Temperature,
                 TopP = settings.TopP,
-                MaxOutputTokens = settings.MaxTokens
+                MaxOutputTokens = settings.MaxTokens,
+                ResponseFormat = settings.OutputFormat switch
+                {
+                    LlmOutputFormat.Json => ChatResponseFormat.Json,
+                    LlmOutputFormat.Text => ChatResponseFormat.Text,
+                    LlmOutputFormat.JsonSchema when settings.SchemaType is not null
+       => ChatResponseFormat.ForJsonSchema(settings.SchemaType, JsonSerializerOptions.Default),
+                    _ => null,          // null 不指定，别硬塞 Text 覆盖服务端默认
+                }
             };
         }
 

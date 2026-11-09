@@ -4,6 +4,8 @@ using Microsoft.Extensions.Configuration;
 using OpenAI;
 using System.ClientModel;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -61,6 +63,85 @@ using (IChatClient chat = new OpenAIClient(
     }
     Console.WriteLine(new string('=', 60));
 
+    // ───────── 测试：结构化输出 ─────────
+    // 目的不是让模型「说 JSON 给用户看」，而是把文本里的信息搬进一个强类型对象，
+    // 再由程序决定怎么呈现。JSON 只是中间产物。
+    Console.WriteLine("【结构化抽取】");
+    Console.WriteLine("输入：订单号 A20261109，状态已发货，金额 128.5 元。");
+
+    // 四段式：角色 / 字段定义 / 示例 / 禁止项
+    // 示例数据故意和真实输入不同（B20260101 / 99.9 vs A20261109 / 128.5），
+    // 否则模型可能把示例原样抄回来。
+    const string extractSystemPrompt = """
+        你是信息抽取器。从用户给的文字里提取订单信息，只输出一个 JSON 对象。
+
+        字段定义：
+        - orderNo：字符串，订单编号，只保留编号本身
+        - status：字符串，订单状态
+        - amount：数字类型，只保留数值，不要单位，不要引号
+
+        示例：
+        输入：订单 B20260101，已签收，共 99.9 元
+        输出：{"orderNo":"B20260101","status":"已签收","amount":99.9}
+
+        只输出 JSON，不要解释，不要 markdown 代码块。
+        """;
+
+    var extractMessages = new List<LlmMessage>
+    {
+        new() { Role = LlmRole.System, Content = extractSystemPrompt },
+        new() { Role = LlmRole.User, Content = "从这句话里提取订单信息：订单号 A20261109，状态已发货，金额 128.5 元。" }
+    };
+
+
+
+    var jsonOptions = new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,   // orderNo / OrderNo 都认
+    };
+
+    // 跑 5 次看分布：一次成功说明不了什么
+    for (int i = 1; i <= 5; i++)
+    {
+        var extract = await llm.AskAsync(extractMessages, new LlmSettings
+        {
+            OutputFormat = LlmOutputFormat.JsonSchema,
+            SchemaType = typeof(ParsedOrder)
+        });
+
+        try
+        {
+            // 必须带 jsonOptions：默认区分大小写，模型给 orderNo、record 写 OrderNo，
+            // 不忽略大小写就是一个字段都匹配不上，而且不报错。
+            var order = JsonSerializer.Deserialize<ParsedOrder>(extract.Text, jsonOptions);
+
+            // 解析成功不等于拿到数据：字段全默认值时说明「名字没对上」，
+            // 这种假成功比抛异常更危险 —— 程序会拿着空对象继续跑。
+            bool isEmpty = order is null
+                || (string.IsNullOrEmpty(order.OrderNo)
+                    && string.IsNullOrEmpty(order.Status)
+                    && order.Amount == 0);
+
+            if (isEmpty)
+            {
+                Console.WriteLine($"第 {i} 次 ⚠️ 解析成功但字段全空");
+                Console.WriteLine($"        原始：{extract.Text}");
+            }
+            else
+            {
+                Console.WriteLine($"第 {i} 次 ✅ {order}");
+            }
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"第 {i} 次 ❌ 解析失败");
+            Console.WriteLine($"        原始：{extract.Text}");
+            Console.WriteLine($"        原因：{ex.Message}");
+        }
+    }
+
+    Console.WriteLine(new string('=', 60));
+
     // ───────── 人设：属于产品设定，所以放在调用方，不写死在 service 里 ─────────
     Console.WriteLine("定义我的人设（直接回车用默认）：");
     var systemPrompt = Console.ReadLine();
@@ -102,7 +183,10 @@ using (IChatClient chat = new OpenAIClient(
         bool reasoningTag = false;
         var answer = new StringBuilder();
 
-        await foreach (LlmChunk chunk in llm.AskStreamAsync(history))
+        await foreach (LlmChunk chunk in llm.AskStreamAsync(history,new LlmSettings
+        {
+            OutputFormat = LlmOutputFormat.Json
+        }))
         {
             if (chunk.IsFinal)
             {
