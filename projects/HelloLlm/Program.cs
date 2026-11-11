@@ -90,7 +90,7 @@ using (IChatClient chat = new OpenAIClient(
     var extractMessages = new List<LlmMessage>
     {
         new() { Role = LlmRole.System, Content = extractSystemPrompt },
-        new() { Role = LlmRole.User, Content = "从这句话里提取订单信息：订单号 A20261109，状态已发货，金额 128.5 元。" }
+        new() { Role = LlmRole.User, Content = "/no_think 从这句话里提取订单信息：订单号 A20261109，状态已发货，金额 128.5 元。" }
     };
 
 
@@ -100,44 +100,37 @@ using (IChatClient chat = new OpenAIClient(
         PropertyNameCaseInsensitive = true,   // orderNo / OrderNo 都认
     };
 
-    // 跑 5 次看分布：一次成功说明不了什么
-    for (int i = 1; i <= 5; i++)
+    // ───────── 两组对照：json_object vs json_schema，各跑 10 次 ─────────
+    // 三种结果分开记：成功 / 空值（解析通过但字段没读到）/ 异常（解析抛错）
+    var groups = new (string Name, LlmSettings Settings)[]
     {
-        var extract = await llm.AskAsync(extractMessages, new LlmSettings
-        {
-            OutputFormat = LlmOutputFormat.JsonSchema,
-            SchemaType = typeof(ParsedOrder)
-        });
-
-        try
-        {
-            // 必须带 jsonOptions：默认区分大小写，模型给 orderNo、record 写 OrderNo，
-            // 不忽略大小写就是一个字段都匹配不上，而且不报错。
-            var order = JsonSerializer.Deserialize<ParsedOrder>(extract.Text, jsonOptions);
-
-            // 解析成功不等于拿到数据：字段全默认值时说明「名字没对上」，
-            // 这种假成功比抛异常更危险 —— 程序会拿着空对象继续跑。
-            bool isEmpty = order is null
-                || (string.IsNullOrEmpty(order.OrderNo)
-                    && string.IsNullOrEmpty(order.Status)
-                    && order.Amount == 0);
-
-            if (isEmpty)
+        ("A 组 json_object", new LlmSettings { OutputFormat = LlmOutputFormat.Json }),
+        ("B 组 json_schema", new LlmSettings
             {
-                Console.WriteLine($"第 {i} 次 ⚠️ 解析成功但字段全空");
-                Console.WriteLine($"        原始：{extract.Text}");
-            }
-            else
-            {
-                Console.WriteLine($"第 {i} 次 ✅ {order}");
-            }
-        }
-        catch (JsonException ex)
+                OutputFormat = LlmOutputFormat.JsonSchema,
+                SchemaType = typeof(ParsedOrder)
+            }),
+    };
+
+    foreach (var g in groups)
+    {
+        Console.WriteLine($"【{g.Name}】");
+        int ok = 0, empty = 0, fail = 0;
+
+        for (int i = 1; i <= 10; i++)
         {
-            Console.WriteLine($"第 {i} 次 ❌ 解析失败");
-            Console.WriteLine($"        原始：{extract.Text}");
-            Console.WriteLine($"        原因：{ex.Message}");
+            var r = await llm.AskAsync(extractMessages, g.Settings);
+            var (kind, detail) = CheckResult(r.Text, jsonOptions);
+
+            if (kind == "成功") ok++;
+            else if (kind == "空值") empty++;
+            else fail++;
+
+            Console.WriteLine($"  {i,2}: {detail}");
         }
+
+        Console.WriteLine($"  → 成功 {ok} / 空值 {empty} / 异常 {fail}");
+        Console.WriteLine(new string('-', 60));
     }
 
     Console.WriteLine(new string('=', 60));
@@ -245,4 +238,27 @@ string Money(decimal? amount)
 
     string money = $"{amount.Value:F6} 元（{amount.Value * 100:F4} 分）";
     return isLocal ? $"等价云端 {money}" : money;
+}
+
+// 只看一件事：模型输出能不能变成一个「有内容的」对象。
+// 「解析不抛异常」不等于成功 —— 字段全默认值也算失败，因为那是空对象。
+static (string Kind, string Detail) CheckResult(string text, JsonSerializerOptions opt)
+{
+    try
+    {
+        var order = JsonSerializer.Deserialize<ParsedOrder>(text, opt);
+
+        bool isEmpty = order is null
+            || (string.IsNullOrEmpty(order.OrderNo)
+                && string.IsNullOrEmpty(order.Status)
+                && order.Amount == 0);
+
+        return isEmpty
+            ? ("空值", $"⚠️ 空值：{text}")
+            : ("成功", $"✅ {order}");
+    }
+    catch (JsonException)
+    {
+        return ("异常", $"❌ 异常：{text}");
+    }
 }
