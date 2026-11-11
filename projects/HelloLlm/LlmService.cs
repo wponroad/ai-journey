@@ -14,14 +14,18 @@ namespace HelloLlm
     {
         private readonly IChatClient _chatClient;
         private readonly CostCalculator? _cost;
-
+        private readonly OrderService _orderService = new();
         /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
         /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
         /// </summary>
         public LlmService(IChatClient chatClient, CostCalculator? cost = null)
         {
-            _chatClient = chatClient;
+            // 包一层装饰器：自动处理「模型请求调用 → 执行工具 → 结果回传 → 再问一次」的循环。
+            // 不包的话，模型返回的只是一条调用请求，Text 是空的，工具永远不会被执行。
+            _chatClient = new ChatClientBuilder(chatClient)
+                .UseFunctionInvocation(configure: c => c.MaximumIterationsPerRequest = 5)
+                .Build();
             _cost = cost;
         }
 
@@ -127,7 +131,7 @@ namespace HelloLlm
         /// settings 为 null 时必须返回 null，不能返回 new ChatOptions()。
         /// 空的 ChatOptions 会把服务端默认值覆盖成一堆 null。
         /// </summary>
-        private static ChatOptions? BuildOptions(LlmSettings? settings)
+        private ChatOptions? BuildOptions(LlmSettings? settings)
         {
             if (settings is null) return null;
 
@@ -136,6 +140,7 @@ namespace HelloLlm
                 Temperature = settings.Temperature,
                 TopP = settings.TopP,
                 MaxOutputTokens = settings.MaxTokens,
+                Tools = [AIFunctionFactory.Create((GetOrderDelegate)_orderService.GetOrder), AIFunctionFactory.Create((GetStockDelegate)_orderService.GetStock), AIFunctionFactory.Create((CalcPriceDelegate)_orderService.CalcPrice)],
                 ResponseFormat = settings.OutputFormat switch
                 {
                     LlmOutputFormat.Json => ChatResponseFormat.Json,

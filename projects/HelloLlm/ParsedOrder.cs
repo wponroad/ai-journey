@@ -1,4 +1,4 @@
-namespace HelloLlm
+﻿namespace HelloLlm
 {
     /// <summary>
     /// 从一段文字里抽出来的订单信息。
