@@ -143,19 +143,16 @@ using (IChatClient chat = new OpenAIClient(
         new()
         {
             Role = LlmRole.System,
-            Content = "你可以调用工具查询订单、库存和价格。需要真实数据时必须调工具，不要凭印象回答。"
+            Content = "你可以调用工具查询订单、库存和价格。需要真实数据时必须调工具，不要凭印象回答。如果工具只返回了标识（订单号、商品编号），而用户要的是详情，必须再用对应工具查一次。"
         },
         new()
         {
             Role = LlmRole.User,
-            Content = "/no_think 客户要买 SKU-003 十件，帮我看看有没有货、总共多少钱。还有帮我查一下订单A20261109的信息"
+            Content = "/no_think 我最近那单的状态是什么？"
         }
     };
 
-    var toolReply = await llm.AskAsync(toolMessages, new LlmSettings
-    {
-        OutputFormat = LlmOutputFormat.Text
-    });
+    var toolReply = await llm.AskWithToolsAsync(toolMessages, new LlmSettings { OutputFormat = LlmOutputFormat.Text }, 5, Console.WriteLine);
 
     Console.WriteLine($"AI > {toolReply.Text}");
     Console.WriteLine($"token 输入 {toolReply.InputTokens} / 输出 {toolReply.OutputTokens}");

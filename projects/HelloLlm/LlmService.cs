@@ -13,14 +13,31 @@ namespace HelloLlm
     public sealed class LlmService : ILLMService
     {
         private readonly IChatClient _chatClient;
+        private readonly IChatClient _rawClient;          // 未包装的原始 client，手写循环时用
         private readonly CostCalculator? _cost;
         private readonly OrderService _orderService = new();
+
+        /// <summary>
+        /// 工具列表。放在字段里，手写循环和 BuildOptions 共用同一份实例。
+        /// </summary>
+        private readonly IList<AITool> _tools;
+
         /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
         /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
         /// </summary>
         public LlmService(IChatClient chatClient, CostCalculator? cost = null)
         {
+            _rawClient = chatClient;
+
+            _tools =
+            [
+                AIFunctionFactory.Create((GetOrderDelegate)_orderService.GetOrder),
+                AIFunctionFactory.Create((GetStockDelegate)_orderService.GetStock),
+                AIFunctionFactory.Create((CalcPriceDelegate)_orderService.CalcPrice),
+                AIFunctionFactory.Create((GetLatestOrderNoDelegate)_orderService.GetLatestOrderNo),
+            ];
+
             // 包一层装饰器：自动处理「模型请求调用 → 执行工具 → 结果回传 → 再问一次」的循环。
             // 不包的话，模型返回的只是一条调用请求，Text 是空的，工具永远不会被执行。
             _chatClient = new ChatClientBuilder(chatClient)
@@ -41,6 +58,57 @@ namespace HelloLlm
             sw.Stop();
 
             return ToReply(response, sw.ElapsedMilliseconds);
+        }
+
+        /// <summary>
+        /// 手写版的工具调用循环 —— 不用 UseFunctionInvocation，每一步自己控制。
+        /// 存在的意义：看清消息怎么长、工具怎么执行、循环怎么停。
+        /// 真实网关必须这么写，因为要在循环里插日志、计费、超时、熔断。
+        /// </summary>
+        /// <param name="trace">每步的回调，用来打印诊断信息</param>
+        public async Task<LlmReply> AskWithToolsAsync(IList<LlmMessage> messages, LlmSettings? settings = null, int maxSteps = 5, Action<string>? trace = null)
+        {
+            var sw = Stopwatch.StartNew();
+            var chatMessages = ToChatMessages(messages);
+            var options = BuildOptions(settings);
+
+            for (int step = 1; step <= maxSteps; step++)
+            {
+                var response = await _rawClient.GetResponseAsync(chatMessages, options);
+
+                // assistant 这条消息必须回填历史：它里面有 FunctionCallContent，
+                // 模型靠它记住「我刚才请求过什么」。不回填的话，它会一直重复请求。
+                chatMessages.AddRange(response.Messages);
+
+                // 调用请求藏在 assistant 消息的 Contents 里，要穿过 Messages 才拿得到
+                var calls = response.Messages
+                    .SelectMany(m => m.Contents)
+                    .OfType<FunctionCallContent>()
+                    .ToList();
+
+                trace?.Invoke($"[step {step}] messages={chatMessages.Count} " +
+                              $"输入={response.Usage?.InputTokenCount} token " +
+                              $"调用={(calls.Count == 0 ? "无（给最终回答）" : string.Join(", ", calls.Select(c => c.Name)))}");
+
+                if (calls.Count == 0)
+                    return ToReply(response, sw.ElapsedMilliseconds);
+
+                foreach (var call in calls)
+                {
+                    object? result;
+                    try
+                    {
+                        var fn = _tools.OfType<AIFunction>().First(f => f.Name == call.Name);
+                        result = await fn.InvokeAsync(new AIFunctionArguments(call.Arguments));
+                    }
+                    catch (Exception ex)
+                    {
+                        result = $"工具执行失败：{ex.Message}";
+                    }
+                    chatMessages.Add(new ChatMessage(ChatRole.Tool,[new FunctionResultContent(call.CallId, result)]));
+                }
+            }
+            throw new InvalidOperationException($"工具调用超过 {maxSteps} 步仍未结束，可能陷入了循环。");
         }
 
         // ───────── 流式 ─────────
@@ -140,7 +208,7 @@ namespace HelloLlm
                 Temperature = settings.Temperature,
                 TopP = settings.TopP,
                 MaxOutputTokens = settings.MaxTokens,
-                Tools = [AIFunctionFactory.Create((GetOrderDelegate)_orderService.GetOrder), AIFunctionFactory.Create((GetStockDelegate)_orderService.GetStock), AIFunctionFactory.Create((CalcPriceDelegate)_orderService.CalcPrice)],
+                Tools = _tools,
                 ResponseFormat = settings.OutputFormat switch
                 {
                     LlmOutputFormat.Json => ChatResponseFormat.Json,

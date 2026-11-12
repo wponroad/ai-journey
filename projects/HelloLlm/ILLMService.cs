@@ -20,5 +20,14 @@
         IAsyncEnumerable<LlmChunk> AskStreamAsync(IList<LlmMessage> messages,
                                                   LlmSettings? settings = null,
                                                   CancellationToken ct = default);
+
+        /// <summary>
+        /// 手写版的工具调用循环：自己执行工具、自己回传结果、自己控制步数。
+        /// trace 用来输出每一步的诊断信息。
+        /// </summary>
+        Task<LlmReply> AskWithToolsAsync(IList<LlmMessage> messages,
+                                         LlmSettings? settings = null,
+                                         int maxSteps = 5,
+                                         Action<string>? trace = null);
     }
 }

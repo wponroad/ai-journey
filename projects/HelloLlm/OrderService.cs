@@ -7,6 +7,7 @@ namespace HelloLlm
     public delegate string GetOrderDelegate(string orderNo);
     public delegate string GetStockDelegate(string sku);
     public delegate string CalcPriceDelegate(string sku, int qty);
+    public delegate string GetLatestOrderNoDelegate();
 
     /// <summary>
     /// 假数据版的业务服务。
@@ -28,6 +29,12 @@ namespace HelloLlm
             ["SKU-002"] = (0, 45.0m),
             ["SKU-003"] = (7, 199.0m),
         };
+
+        [Description("查询最近一笔订单的订单号。当用户说「最近那单」「上次那个订单」但没给订单号时，先用这个。")]
+        public string GetLatestOrderNo()
+        {
+            return "A20261111";
+        }
 
         [Description("按订单号查询订单详情，返回订单状态和金额。订单不存在时返回提示。")]
         public string GetOrder([Description("订单号，例如 A20261109")] string orderNo)
