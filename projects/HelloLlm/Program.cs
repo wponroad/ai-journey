@@ -135,6 +135,37 @@ using (IChatClient chat = new OpenAIClient(
 
     //Console.WriteLine(new string('=', 60));
 
+    // ───────── Prompt 模板库 ─────────
+    // 模板文件跟着编译输出走（csproj 里配了 CopyToOutputDirectory），运行时从输出目录读
+    var promptDir = Path.Combine(AppContext.BaseDirectory, "prompts");
+    var prompts = PromptLibrary.Load(promptDir);
+    var extractTpl = prompts.Get("order-extract");
+
+    Console.WriteLine("【Prompt 模板】");
+    Console.WriteLine($"已加载 {prompts.All.Count} 个：{string.Join("、", prompts.All)}");
+    Console.WriteLine($"---- {extractTpl} 组装结果 ----");
+    Console.WriteLine(extractTpl.Build());
+    Console.WriteLine(new string('-', 60));
+
+    // 用模板跑一次抽取，验证和之前手写 prompt 的效果一致
+    var tplMessages = new List<LlmMessage>
+    {
+        new() { Role = LlmRole.System, Content = extractTpl.Build() },
+        new() { Role = LlmRole.User, Content = "/no_think 从这句话里提取订单信息：订单号 C20261225，状态待付款，金额 88 元。" }
+    };
+
+    var tplReply = await llm.AskAsync(tplMessages, new LlmSettings
+    {
+        OutputFormat = LlmOutputFormat.Json
+    });
+
+    Console.WriteLine($"原始输出：{tplReply.Text}");
+
+    var tplOrder = JsonSerializer.Deserialize<ParsedOrder>(tplReply.Text,
+        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+    Console.WriteLine($"解析结果：{tplOrder}");
+    Console.WriteLine(new string('=', 60));
+
     // ───────── 工具调用：模型只请求，执行在你这里 ─────────
     Console.WriteLine("【工具调用】");
 
