@@ -66,15 +66,28 @@ namespace HelloLlm
         /// 真实网关必须这么写，因为要在循环里插日志、计费、超时、熔断。
         /// </summary>
         /// <param name="trace">每步的回调，用来打印诊断信息</param>
-        public async Task<LlmReply> AskWithToolsAsync(IList<LlmMessage> messages, LlmSettings? settings = null, int maxSteps = 5, Action<string>? trace = null)
+        /// <param name="onCalls">每轮结束后回传「调用了哪些工具」，调用方拿去做统计</param>
+        public async Task<LlmReply> AskWithToolsAsync(IList<LlmMessage> messages, LlmSettings? settings = null,
+                                                      int maxSteps = 5, Action<string>? trace = null,
+                                                      Action<IReadOnlyList<ToolCallTrace>>? onCalls = null)
         {
             var sw = Stopwatch.StartNew();
             var chatMessages = ToChatMessages(messages);
             var options = BuildOptions(settings);
 
+            // 多轮要累加用量：账单按每一次 API 调用算，只看最后一轮会严重低估成本
+            long totalIn = 0, totalOut = 0, totalCached = 0;
+
             for (int step = 1; step <= maxSteps; step++)
             {
                 var response = await _rawClient.GetResponseAsync(chatMessages, options);
+
+                if (response.Usage is { } u)
+                {
+                    totalIn += u.InputTokenCount ?? 0;
+                    totalOut += u.OutputTokenCount ?? 0;
+                    totalCached += u.CachedInputTokenCount ?? 0;
+                }
 
                 // assistant 这条消息必须回填历史：它里面有 FunctionCallContent，
                 // 模型靠它记住「我刚才请求过什么」。不回填的话，它会一直重复请求。
@@ -91,7 +104,26 @@ namespace HelloLlm
                               $"调用={(calls.Count == 0 ? "无（给最终回答）" : string.Join(", ", calls.Select(c => c.Name)))}");
 
                 if (calls.Count == 0)
-                    return ToReply(response, sw.ElapsedMilliseconds);
+                {
+                    var info = _rawClient.GetService<ChatClientMetadata>();
+                    return new LlmReply
+                    {
+                        Text = response.Text ?? "",
+                        InputTokens = totalIn,
+                        OutputTokens = totalOut,
+                        CachedInputTokens = totalCached,
+                        Amount = CalcAmount(totalIn, totalOut, totalCached),
+                        ElapsedMs = sw.ElapsedMilliseconds,
+                        ModelType = info?.ProviderName,
+                        ModeUrl = info?.ProviderUri?.AbsoluteUri,
+                        ModeId = info?.DefaultModelId
+                    };
+                }
+
+                // 回传结构化调用记录，调用方不用去解析 trace 字符串
+                onCalls?.Invoke(calls
+                    .Select(c => new ToolCallTrace(c.Name, JsonSerializer.Serialize(c.Arguments)))
+                    .ToList());
 
                 foreach (var call in calls)
                 {
@@ -103,11 +135,18 @@ namespace HelloLlm
                     }
                     catch (Exception ex)
                     {
+                        // 工具炸了不能把整个对话炸掉。把错误当成结果交回给模型，
+                        // 它至少能告诉用户「查询失败了」，而不是整个请求 500。
                         result = $"工具执行失败：{ex.Message}";
                     }
-                    chatMessages.Add(new ChatMessage(ChatRole.Tool,[new FunctionResultContent(call.CallId, result)]));
+
+                    // FunctionResultContent 必须绑定 CallId —— 模型靠这个 ID
+                    // 把「结果」和「刚才那次请求」对上。绑错就是乱套。
+                    chatMessages.Add(new ChatMessage(ChatRole.Tool,
+                        [new FunctionResultContent(call.CallId, result)]));
                 }
             }
+
             throw new InvalidOperationException($"工具调用超过 {maxSteps} 步仍未结束，可能陷入了循环。");
         }
 

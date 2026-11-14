@@ -28,6 +28,7 @@
         Task<LlmReply> AskWithToolsAsync(IList<LlmMessage> messages,
                                          LlmSettings? settings = null,
                                          int maxSteps = 5,
-                                         Action<string>? trace = null);
+                                         Action<string>? trace = null,
+                                         Action<IReadOnlyList<ToolCallTrace>>? onCalls = null);
     }
 }
