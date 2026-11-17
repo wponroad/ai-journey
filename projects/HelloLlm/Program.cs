@@ -54,11 +54,19 @@ const string toolSystemPrompt = """
     - 如果工具只返回了标识（如订单号），而用户要的是详情，必须再用对应工具查一次
     """;
 
-using (IChatClient chat = new OpenAIClient(
-       new ApiKeyCredential(options.ApiKey),
-       new OpenAIClientOptions { Endpoint = new Uri(options.BaseUrl) })
-   .GetChatClient(options.Model)
-   .AsIChatClient())
+IChatClient realChat = new OpenAIClient(
+        new ApiKeyCredential(options.ApiKey),
+        new OpenAIClientOptions { Endpoint = new Uri(options.BaseUrl) })
+    .GetChatClient(options.Model)
+    .AsIChatClient();
+
+// 故障注入开关：failTimes 是「前几次调用故意失败」，0 = 不注入。
+// 平时保持 0，测重试/熔断时改成 99（配合 Faults.RateLimited / ServerError / Timeout）。
+// 位置必须在 Polly 的内层 —— flaky 包在 Polly 外面的话，它一抛异常 Polly 根本没被执行到。
+var failTimes = 1;
+using (IChatClient chat = failTimes > 0
+           ? new FlakyChatClient(realChat, failTimes, Faults.RateLimited)
+           : realChat)
 {
     ILLMService llm = new LlmService(chat, cost);
     var cli = new ChatCli(llm, toolSystemPrompt, isLocal);

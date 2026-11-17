@@ -26,6 +26,9 @@ namespace HelloLlm
         public string? Error { get; set; }
         public bool Ok { get; set; }
         public string FailReason { get; set; } = "";
+
+        /// <summary>这次回答是否来自降级规则（模型挂了走正则兜底）</summary>
+        public bool IsFallback { get; set; }
     }
 
     public static class TestCases

@@ -124,6 +124,7 @@ namespace HelloLlm
                 record.OutputTokens = reply.OutputTokens;
                 record.Cost = reply.Amount;
                 record.ElapsedMs = reply.ElapsedMs;
+                record.IsFallback = reply.IsFallback;
             }
             catch (Exception ex)
             {
@@ -176,7 +177,10 @@ namespace HelloLlm
 
         private void PrintRecord(RunRecord r)
         {
-            Console.WriteLine($"  AI > {r.Answer}");
+            // 降级必须显式标出来。不标的话，用户以为模型在答，监控以为系统正常 ——
+            // 降级做得越好，故障越难被发现。
+            var tag = r.IsFallback ? "  [降级·规则兜底]" : "";
+            Console.WriteLine($"  AI > {r.Answer}{tag}");
             var tools = r.ToolCalls.Count == 0 ? "无" : string.Join(" → ", r.ToolCalls.Select(t => t.Name));
             Console.WriteLine($"  步数 {r.Steps} | 工具 {tools}");
             var costLabel = _isLocal ? "等价云端成本" : "成本";

@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel;
+using System.Text.RegularExpressions;
 
 namespace HelloLlm
 {
@@ -72,6 +73,18 @@ namespace HelloLlm
                 return $"{sku} 库存不足：当前只有 {p.Stock} 件，买不了 {qty} 件";
 
             return $"{sku} × {qty} 件 = {p.Price * qty:F2} 元（单价 {p.Price:F2} 元）";
+        }
+
+        public string RuleBasedAnswer(string question)
+        {
+            // 订单号：一个大写字母 + 8 位数字
+            var orderNo = Regex.Match(question, @"[A-Z]\d{8}").Value;
+            if (orderNo.Length > 0) return new OrderService().GetOrder(orderNo);
+
+            var sku = Regex.Match(question, @"SKU-\d{3}").Value;
+            if (sku.Length > 0) return new OrderService().GetStock(sku);
+
+            return "智能助手暂时不可用，请稍后再试。";
         }
     }
 }

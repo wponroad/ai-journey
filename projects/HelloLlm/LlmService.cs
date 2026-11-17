@@ -1,7 +1,13 @@
 ﻿using Microsoft.Extensions.AI;
+using Polly;
+using Polly.CircuitBreaker;
+using Polly.Retry;
+using Polly.Timeout;
 using System.Diagnostics;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace HelloLlm
 {
@@ -23,11 +29,80 @@ namespace HelloLlm
         private readonly IList<AITool> _tools;
 
         /// <summary>
+        /// 重试策略。提到字段而不是每次请求现建，有两个原因：
+        /// 一是两条路径（AskAsync / AskWithToolsAsync）共用同一份，不会出现「改了一条忘另一条」；
+        /// 二是策略属于配置，不是每次调用的产物。
+        /// </summary>
+        private readonly ResiliencePipeline _pipeline = new ResiliencePipelineBuilder()
+            // 降级没有放在这里。Polly 的 AddFallback 拿不到用户原始的问题，
+            // 而规则兜底必须先知道「问了什么」。所以降级写在 AskWithToolsAsync
+            // 外层的 try/catch 里 —— 策略层管「失败了怎么办」，业务层管「给用户什么」。
+            // 总时长：含重试在内最多 30 秒。必须放最外层 ——
+            // 放内层的话它只管单次，重试 4 次就是 4 × 30 秒，封不住用户等待时间。
+            .AddTimeout(TimeSpan.FromSeconds(100))
+            .AddRetry(new RetryStrategyOptions
+            {
+                // 只对「可能自己好」的故障重试。4xx 一律不重试 —— 401 key 无效、
+                // 400 参数错，重试一百次还是错，只是多花几笔钱。
+                ShouldHandle = new PredicateBuilder()
+                    .Handle<HttpRequestException>(ex => ex.StatusCode is
+                        HttpStatusCode.RequestTimeout or
+                        HttpStatusCode.TooManyRequests or
+                        HttpStatusCode.InternalServerError or
+                        HttpStatusCode.BadGateway or
+                        HttpStatusCode.ServiceUnavailable or
+                        HttpStatusCode.GatewayTimeout)
+                .Handle<TimeoutRejectedException>()
+                    .Handle<TaskCanceledException>(),
+
+                MaxRetryAttempts = 4,                           // 总共执行 5 次（1 次原始 + 4 次重试）
+                Delay = TimeSpan.FromSeconds(1),
+                BackoffType = DelayBackoffType.Exponential,     // 1s → 2s → 4s
+                MaxDelay = TimeSpan.FromSeconds(10),            // 封顶，否则第 10 次要等 8 分钟
+                UseJitter = true,                               // 抖动：把重试时刻散开，避免重试风暴
+                //UseJitter = false,          // 关掉 Polly 的去相关抖动
+                //DelayGenerator = args =>    // 自己算：2^n 秒 + 0~300ms 随机
+                //    new ValueTask<TimeSpan?>(
+                //        TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber))
+                //        + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 300))),
+                OnRetry = args =>
+                {
+                    // AttemptNumber 是 0-based（第 0 次重试 = 第一次重试），+1 才是人话
+                    Console.WriteLine($"[retry {args.AttemptNumber + 1}] {args.Outcome.Exception?.Message}，" +
+                                      $"等 {args.RetryDelay.TotalSeconds:F1}s");
+                    return default;                             // 返回 ValueTask，不是 void
+                }
+            })
+            .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+            {
+                FailureRatio = 0.5,                              // 失败率超一半
+                MinimumThroughput = 4,                           // 至少 4 次调用才判定
+                SamplingDuration = TimeSpan.FromSeconds(90),     // 统计窗口
+                BreakDuration = TimeSpan.FromSeconds(20),        // 打开后多久转半开
+                ShouldHandle = new PredicateBuilder()
+                    .Handle<HttpRequestException>(ex => ex.StatusCode is
+                        HttpStatusCode.RequestTimeout or
+                        HttpStatusCode.TooManyRequests or
+                        HttpStatusCode.InternalServerError or
+                        HttpStatusCode.BadGateway or
+                        HttpStatusCode.ServiceUnavailable or
+                        HttpStatusCode.GatewayTimeout)
+                        .Handle<TimeoutRejectedException>()
+                    .Handle<TaskCanceledException>(),
+                OnOpened = args => { Console.WriteLine("[circuit] 打开"); return default; },
+                OnClosed = args => { Console.WriteLine("[circuit] 关闭"); return default; },
+            })
+            // 单次：一次调用最多 15 秒。放最内层，防止某一次卡死。
+            .AddTimeout(TimeSpan.FromSeconds(10))
+            .Build();
+
+        /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
         /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
         /// </summary>
         public LlmService(IChatClient chatClient, CostCalculator? cost = null)
         {
+            
             _rawClient = chatClient;
 
             _tools =
@@ -54,7 +129,8 @@ namespace HelloLlm
         public async Task<LlmReply> AskAsync(IList<LlmMessage> messages, LlmSettings? settings = null)
         {
             var sw = Stopwatch.StartNew();
-            var response = await _chatClient.GetResponseAsync(ToChatMessages(messages), BuildOptions(settings));
+            var response = await _pipeline.ExecuteAsync(
+                async ct => await _rawClient.GetResponseAsync(ToChatMessages(messages), BuildOptions(settings), ct));
             sw.Stop();
 
             return ToReply(response, sw.ElapsedMilliseconds);
@@ -72,21 +148,72 @@ namespace HelloLlm
                                                       Action<IReadOnlyList<ToolCallTrace>>? onCalls = null)
         {
             var sw = Stopwatch.StartNew();
+
+            // 用量累加器放在外层：失败时它里面还存着「前面几轮已经花掉的钱」。
+            // 如果它只是 core 里的局部变量，异常一抛，这些数字就跟着变量一起没了 ——
+            // 钱花了，账没记，这是计费系统最典型的漏洞。
+            var usage = new UsageAccumulator();
+
+            try
+            {
+                return await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
+            }
+            catch (Exception ex) when (IsServiceDown(ex))
+            {
+                // 降级：服务不可用时用规则兜底，不把异常抛给用户。
+                // 只兜「服务挂了」这一类。参数错误、代码 bug 要照常抛 ——
+                // 否则自己的 bug 会被规则悄悄盖住，永远发现不了。
+                var question = "订单 A20261109 什么状态";
+                Console.WriteLine($"[degrade] {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[degrade] 走规则兜底，问题：{question}");
+                Console.WriteLine(usage.IsEmpty
+                    ? "[degrade] 没有产生 token 消耗（请求没真正发出去）"
+                    : $"[degrade] 但已经花掉 输入 {usage.Input} / 输出 {usage.Output} token，照记");
+
+                return new LlmReply
+                {
+                    Text = RuleBasedAnswer(question),
+                    IsFallback = true,
+                    ElapsedMs = sw.ElapsedMilliseconds,
+
+                    // 降级不等于免费。熔断短路那次确实零消耗（请求压根没发），
+                    // 但「第 2 轮超时」这种情况，第 1 轮的 token 是真金白银付过的。
+                    InputTokens = usage.IsEmpty ? null : usage.Input,
+                    OutputTokens = usage.IsEmpty ? null : usage.Output,
+                    CachedInputTokens = usage.IsEmpty ? null : usage.Cached,
+                    Amount = usage.IsEmpty ? null : CalcAmount(usage.Input, usage.Output, usage.Cached),
+                };
+            }
+        }
+
+        /// <summary>
+        /// 真正干活的实现。抽出来只是为了让外层能整体包一层 try/catch ——
+        /// 里面每个策略的位置一个没变，变的只是「失败时谁来收尾」。
+        /// </summary>
+        private async Task<LlmReply> AskWithToolsCoreAsync(IList<LlmMessage> messages, LlmSettings? settings,
+                                                           int maxSteps, Action<string>? trace,
+                                                           Action<IReadOnlyList<ToolCallTrace>>? onCalls,
+                                                           Stopwatch sw, UsageAccumulator usage)
+        {
             var chatMessages = ToChatMessages(messages);
             var options = BuildOptions(settings);
 
-            // 多轮要累加用量：账单按每一次 API 调用算，只看最后一轮会严重低估成本
-            long totalIn = 0, totalOut = 0, totalCached = 0;
+            // 用量累加：账单按每一次 API 调用算，只看最后一轮会严重低估成本。
+            // 存在 usage 对象里而不是局部变量，是为了失败时外层还能读到。
 
             for (int step = 1; step <= maxSteps; step++)
             {
-                var response = await _rawClient.GetResponseAsync(chatMessages, options);
+                // 重试包在循环体里，只管单次调用。
+                // 不能包住整个 for：第 2 轮失败时第 1 轮的工具已经执行过了，
+                // 重跑循环会再调一次 GetOrder —— 非幂等，真实系统里就是重复下单。
+                var response = await _pipeline.ExecuteAsync(
+                    async ct => await _rawClient.GetResponseAsync(chatMessages, options, ct));
 
                 if (response.Usage is { } u)
                 {
-                    totalIn += u.InputTokenCount ?? 0;
-                    totalOut += u.OutputTokenCount ?? 0;
-                    totalCached += u.CachedInputTokenCount ?? 0;
+                    usage.Input += u.InputTokenCount ?? 0;
+                    usage.Output += u.OutputTokenCount ?? 0;
+                    usage.Cached += u.CachedInputTokenCount ?? 0;
                 }
 
                 // assistant 这条消息必须回填历史：它里面有 FunctionCallContent，
@@ -109,10 +236,10 @@ namespace HelloLlm
                     return new LlmReply
                     {
                         Text = response.Text ?? "",
-                        InputTokens = totalIn,
-                        OutputTokens = totalOut,
-                        CachedInputTokens = totalCached,
-                        Amount = CalcAmount(totalIn, totalOut, totalCached),
+                        InputTokens = usage.Input,
+                        OutputTokens = usage.Output,
+                        CachedInputTokens = usage.Cached,
+                        Amount = CalcAmount(usage.Input, usage.Output, usage.Cached),
                         ElapsedMs = sw.ElapsedMilliseconds,
                         ModelType = info?.ProviderName,
                         ModeUrl = info?.ProviderUri?.AbsoluteUri,
@@ -257,6 +384,63 @@ namespace HelloLlm
                     _ => null,          // null 不指定，别硬塞 Text 覆盖服务端默认
                 }
             };
+        }
+
+        /// <summary>
+        /// 一次请求内跨重试轮次累加的 token 用量。
+        ///
+        /// 单独做成对象而不是局部变量，是因为它必须能穿过「抛异常」这个边界。
+        /// 局部变量的生命周期止于方法返回，异常一抛它就没了 —— 而恰恰是失败的那一次，
+        /// 最需要知道「前面已经花掉多少」。
+        /// </summary>
+        private sealed class UsageAccumulator
+        {
+            public long Input;
+            public long Output;
+            public long Cached;
+
+            /// <summary>全零 = 请求压根没发出去（比如熔断短路），不是「发了但没算出来」</summary>
+            public bool IsEmpty => Input == 0 && Output == 0 && Cached == 0;
+        }
+
+        /// <summary>
+        /// 哪些异常算「服务不可用」，值得用规则兜底。
+        ///
+        /// 这个清单必须窄。参数错误（400）、认证失败（401）、自己的代码 bug
+        /// 都不该被兜底盖住 —— 兜底会让它们变成一句「服务暂时不可用」，
+        /// 你就再也不会去修了。
+        /// </summary>
+        private static bool IsServiceDown(Exception ex) => ex switch
+        {
+            BrokenCircuitException => true,      // 熔断打开，压根没发请求
+            TimeoutRejectedException => true,    // Polly 主动掐断
+            HttpRequestException => true,        // 429 / 5xx / 连不上
+            _ => false,
+        };
+
+        /// <summary>
+        /// 规则兜底：模型挂了的时候，用正则 + 工具把最简单的那部分事情办了。
+        ///
+        /// 为什么值得做：模型在这类任务里干的事就两件 —— 识别意图、抽参数。
+        /// 订单号是 [A-Z]\d{8}，SKU 是 SKU-\d{3}，正则比模型稳得多，而且永远不会挂。
+        ///
+        /// 这也是「降级不是道歉」的意思：能办的事照样办，办不了的才说办不了。
+        /// </summary>
+        private string RuleBasedAnswer(string question)
+        {
+            // 订单号：一个大写字母 + 8 位数字，例如 A20261109
+            var orderNo = Regex.Match(question, @"[A-Z]\d{8}").Value;
+            if (orderNo.Length > 0)
+                return _orderService.GetOrder(orderNo);
+
+            // 商品编号：SKU- 加三位数字，例如 SKU-001
+            var sku = Regex.Match(question, @"SKU-\d{3}").Value;
+            if (sku.Length > 0)
+                return _orderService.GetStock(sku);
+
+            // 连规则都答不了，才老实说 —— 但要告诉用户「现在还能做什么」，
+            // 不能只说「服务不可用」然后把人晾在那儿。
+            return "智能助手暂时不可用。你可以直接说订单号（如 A20261109）或商品编号（如 SKU-001），我按规则帮你查。";
         }
 
         private LlmReply ToReply(ChatResponse response, long elapsedMs)
