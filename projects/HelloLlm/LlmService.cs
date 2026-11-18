@@ -23,6 +23,13 @@ namespace HelloLlm
         private readonly CostCalculator? _cost;
         private readonly OrderService _orderService = new();
 
+        // 记账：为 null 表示不记账（测试、临时脚本可以不传）。
+        // 用户和部门是「这次调用属于谁」，所以跟服务实例绑定，
+        // 真实系统里从请求上下文取，这里硬编码。
+        private readonly UsageStore? _usageStore;
+        private readonly string _userId;
+        private readonly string _department;
+
         /// <summary>
         /// 工具列表。放在字段里，手写循环和 BuildOptions 共用同一份实例。
         /// </summary>
@@ -99,11 +106,19 @@ namespace HelloLlm
         /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
         /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
+        ///
+        /// usageStore 为 null 表示不记账。记账放在这一层而不是外面包一层装饰器，
+        /// 是因为只有这里能看到重试真正消耗了多少 —— 装饰器只能看到最终结果。
         /// </summary>
-        public LlmService(IChatClient chatClient, CostCalculator? cost = null)
+        public LlmService(IChatClient chatClient, CostCalculator? cost = null,
+                          UsageStore? usageStore = null,
+                          string userId = "anonymous", string department = "unknown")
         {
             
             _rawClient = chatClient;
+            _usageStore = usageStore;
+            _userId = userId;
+            _department = department;
 
             _tools =
             [
@@ -128,12 +143,24 @@ namespace HelloLlm
 
         public async Task<LlmReply> AskAsync(IList<LlmMessage> messages, LlmSettings? settings = null)
         {
+            var requestId = NewRequestId();
             var sw = Stopwatch.StartNew();
-            var response = await _pipeline.ExecuteAsync(
-                async ct => await _rawClient.GetResponseAsync(ToChatMessages(messages), BuildOptions(settings), ct));
-            sw.Stop();
+            try
+            {
+                var response = await _pipeline.ExecuteAsync(
+                    async ct => await _rawClient.GetResponseAsync(ToChatMessages(messages), BuildOptions(settings), ct));
+                sw.Stop();
 
-            return ToReply(response, sw.ElapsedMilliseconds);
+                var reply = ToReply(response, sw.ElapsedMilliseconds);
+                RecordUsage(requestId, reply, sw.ElapsedMilliseconds);
+                return reply;
+            }
+            catch (Exception ex)
+            {
+                // 失败也要留痕：这一行证明「尝试发生过」，将来对账时没有它就完全查不到
+                RecordError(requestId, ex, sw.ElapsedMilliseconds);
+                throw;      // 记账是旁观者，异常必须继续往上抛
+            }
         }
 
         /// <summary>
@@ -147,6 +174,7 @@ namespace HelloLlm
                                                       int maxSteps = 5, Action<string>? trace = null,
                                                       Action<IReadOnlyList<ToolCallTrace>>? onCalls = null)
         {
+            var requestId = NewRequestId();
             var sw = Stopwatch.StartNew();
 
             // 用量累加器放在外层：失败时它里面还存着「前面几轮已经花掉的钱」。
@@ -156,7 +184,9 @@ namespace HelloLlm
 
             try
             {
-                return await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
+                var reply = await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
+                RecordUsage(requestId, reply, sw.ElapsedMilliseconds);
+                return reply;
             }
             catch (Exception ex) when (IsServiceDown(ex))
             {
@@ -170,7 +200,7 @@ namespace HelloLlm
                     ? "[degrade] 没有产生 token 消耗（请求没真正发出去）"
                     : $"[degrade] 但已经花掉 输入 {usage.Input} / 输出 {usage.Output} token，照记");
 
-                return new LlmReply
+                var fallbackReply = new LlmReply
                 {
                     Text = RuleBasedAnswer(question),
                     IsFallback = true,
@@ -183,6 +213,18 @@ namespace HelloLlm
                     CachedInputTokens = usage.IsEmpty ? null : usage.Cached,
                     Amount = usage.IsEmpty ? null : CalcAmount(usage.Input, usage.Output, usage.Cached),
                 };
+
+                // Status 记成 fallback 而不是 ok ——
+                // 混在一起的话，降级率永远看不见，模型挂了三个月你都以为系统正常。
+                RecordUsage(requestId, fallbackReply, sw.ElapsedMilliseconds);
+                return fallbackReply;
+            }
+            catch (Exception ex)
+            {
+                // 不在 IsServiceDown 清单里的异常（自己的 bug、参数错），
+                // 也要留痕，但必须原样抛出去 —— 兜底会把它们藏起来。
+                RecordError(requestId, ex, sw.ElapsedMilliseconds);
+                throw;
             }
         }
 
@@ -286,57 +328,82 @@ namespace HelloLlm
                                                                LlmSettings? settings = null,
                                                                [EnumeratorCancellation] CancellationToken ct = default)
         {
+            var requestId = NewRequestId();
             var sw = Stopwatch.StartNew();
             long? input = null;
             long? output = null;
             long? cachedInput = null;
+            decimal? amount = null;
+            bool finished = false;
 
-            await foreach (ChatResponseUpdate update in
-                _chatClient.GetStreamingResponseAsync(ToChatMessages(messages), BuildOptions(settings), cancellationToken: ct))
+            try
             {
-                foreach (AIContent content in update.Contents)
+                await foreach (ChatResponseUpdate update in
+                    _chatClient.GetStreamingResponseAsync(ToChatMessages(messages), BuildOptions(settings), cancellationToken: ct))
                 {
-                    switch (content)
+                    foreach (AIContent content in update.Contents)
                     {
-                        // 思考过程（推理模型才有，qwen3 默认开，DeepSeek 也会回传）
-                        case TextReasoningContent reasoning when !string.IsNullOrEmpty(reasoning.Text):
-                            yield return new LlmChunk
-                            {
-                                Text = reasoning.Text,
-                                IsReasoning = true,
-                                ElapsedMs = sw.ElapsedMilliseconds
-                            };
-                            break;
+                        switch (content)
+                        {
+                            // 思考过程（推理模型才有，qwen3 默认开，DeepSeek 也会回传）
+                            case TextReasoningContent reasoning when !string.IsNullOrEmpty(reasoning.Text):
+                                yield return new LlmChunk
+                                {
+                                    Text = reasoning.Text,
+                                    IsReasoning = true,
+                                    ElapsedMs = sw.ElapsedMilliseconds
+                                };
+                                break;
 
-                        // 正文
-                        case TextContent text when !string.IsNullOrEmpty(text.Text):
-                            yield return new LlmChunk
-                            {
-                                Text = text.Text,
-                                ElapsedMs = sw.ElapsedMilliseconds
-                            };
-                            break;
+                            // 正文
+                            case TextContent text when !string.IsNullOrEmpty(text.Text):
+                                yield return new LlmChunk
+                                {
+                                    Text = text.Text,
+                                    ElapsedMs = sw.ElapsedMilliseconds
+                                };
+                                break;
 
-                        // 用量统计：流式下不是单独的属性，也是当成一片 content 塞进来的
-                        case UsageContent usageContent when usageContent.Details is { } details:
-                            input = details.InputTokenCount;
-                            output = details.OutputTokenCount;
-                            cachedInput = details.CachedInputTokenCount;
-                            break;
+                            // 用量统计：流式下不是单独的属性，也是当成一片 content 塞进来的
+                            case UsageContent usageContent when usageContent.Details is { } details:
+                                input = details.InputTokenCount;
+                                output = details.OutputTokenCount;
+                                cachedInput = details.CachedInputTokenCount;
+                                break;
+                        }
                     }
                 }
-            }
 
-            // 收尾片：文本为空，只带统计。调用方靠 IsFinal 判断「真的结束了」
-            yield return new LlmChunk
+                amount = CalcAmount(input, output, cachedInput);
+
+                // 收尾片：文本为空，只带统计。调用方靠 IsFinal 判断「真的结束了」
+                yield return new LlmChunk
+                {
+                    IsFinal = true,
+                    ElapsedMs = sw.ElapsedMilliseconds,
+                    InputTokens = input,
+                    OutputTokens = output,
+                    CachedInputTokens = cachedInput,
+                    Amount = amount
+                };
+
+                finished = true;
+            }
+            finally
             {
-                IsFinal = true,
-                ElapsedMs = sw.ElapsedMilliseconds,
-                InputTokens = input,
-                OutputTokens = output,
-                CachedInputTokens = cachedInput,
-                Amount = CalcAmount(input, output, cachedInput)
-            };
+                // C# 不允许在带 catch 的 try 里 yield，所以流式只能用 finally 记账：
+                // 走到最后一片 = 正常结束；否则 = 中途断了（抛异常，或者调用方提前 Dispose）。
+                SafeInsert(new LlmUsageRow(
+                    requestId, _userId, _department, null,
+                    finished ? input : null,
+                    finished ? output : null,
+                    finished ? cachedInput : null,
+                    finished ? UsageStore.ToMicros(amount) : null,
+                    sw.ElapsedMilliseconds,
+                    finished ? "ok" : "error",
+                    finished ? null : "StreamInterrupted",
+                    null, DateTime.Now));
+            }
         }
 
         // ───────── 翻译（这个类存在的唯一理由） ─────────
@@ -401,6 +468,46 @@ namespace HelloLlm
 
             /// <summary>全零 = 请求压根没发出去（比如熔断短路），不是「发了但没算出来」</summary>
             public bool IsEmpty => Input == 0 && Output == 0 && Cached == 0;
+        }
+
+        // ───────── 记账 ─────────
+
+        private static string NewRequestId() => Guid.NewGuid().ToString("N")[..16];
+
+        /// <summary>成功或降级：把 reply 上的用量写成一行。</summary>
+        private void RecordUsage(string requestId, LlmReply reply, long elapsedMs)
+            => SafeInsert(new LlmUsageRow(
+                requestId, _userId, _department, reply.ModeId,
+                reply.InputTokens, reply.OutputTokens, reply.CachedInputTokens,
+                UsageStore.ToMicros(reply.Amount),
+                elapsedMs,
+                // fallback 和 ok 必须分开记：混在一起，降级率就永远看不见，
+                // 模型挂了三个月你都以为系统一切正常。
+                reply.IsFallback ? "fallback" : "ok",
+                null, null, DateTime.Now));
+
+        /// <summary>失败：没有 token 数据，但「这次尝试发生过」必须留痕，否则对账时完全查不到。</summary>
+        private void RecordError(string requestId, Exception ex, long elapsedMs)
+            => SafeInsert(new LlmUsageRow(
+                requestId, _userId, _department, null,
+                null, null, null, null,
+                elapsedMs, "error", ex.GetType().Name, null, DateTime.Now));
+
+        /// <summary>
+        /// 记账失败不能拖垮主流程 —— 但也不能悄悄吞掉，否则等于没有记账。
+        /// </summary>
+        private void SafeInsert(LlmUsageRow row)
+        {
+            if (_usageStore is null) return;
+
+            try
+            {
+                _usageStore.Insert(row);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[meter] 记账失败（不影响本次调用）：{ex.Message}");
+            }
         }
 
         /// <summary>
