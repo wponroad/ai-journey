@@ -51,5 +51,9 @@
         /// <b>降级做得越好，故障越难被发现。</b>
         /// </summary>
         public bool IsFallback { get; init; }
+        /// <summary>true 表示这次没调模型，直接返回了缓存。</summary>
+        public bool IsCacheHit { get; init; }
+        /// <summary>缓存类型：exact（一字不差）/ semantic（意思相近）。未命中时为 null。</summary>
+        public string? CacheKind { get; init; }
     }
 }

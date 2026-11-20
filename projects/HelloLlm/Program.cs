@@ -77,12 +77,30 @@ using (IChatClient chat = failTimes > 0
 
     var store = usage.Enabled ? new UsageStore(dbPath) : null;
 
-    ILLMService llm = new LlmService(chat, cost, store, usage.UserId, usage.Department);
+    // 缓存：Redis 连不上就降级为「不缓存」，不让整个程序起不来。
+    var cacheOptions = config.GetSection("Cache").Get<CacheOptions>() ?? new CacheOptions();
+    LlmCache? cache = null;
+
+    if (cacheOptions.Enabled)
+    {
+        try
+        {
+            var embedClient = new EmbeddingClient(options.BaseUrl, cacheOptions.EmbeddingModel);
+            cache = new LlmCache(cacheOptions.Redis, embedClient, cacheOptions.Threshold, cacheOptions.TtlMinutes);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Redis缓存失败，本次不缓存：{ex.Message}");
+        }
+    }
+
+    ILLMService llm = new LlmService(chat, cost, store, usage.UserId, usage.Department, cache);
     var cli = new ChatCli(llm, toolSystemPrompt, isLocal);
 
     Console.WriteLine($"配置节   {modelType}");
     Console.WriteLine($"模型     {options.Model}");
     Console.WriteLine($"地址     {options.BaseUrl}");
+    Console.WriteLine($"缓存     {(cache is null ? "未启用" : $"已启用（{cacheOptions.Redis}，阈值 {cacheOptions.Threshold}）")}");
     if (cost is not null && pricing is not null)
     {
         bool peak = cost.IsPeakTime(DateTime.Now);
@@ -107,4 +125,11 @@ using (IChatClient chat = failTimes > 0
     Console.WriteLine("──────── 最近 10 条 ────────");
     foreach (var line in store.RecentRows(10))
         Console.WriteLine($"  {line}");
+
+    if (cache is not null)
+    {
+        Console.WriteLine();
+        Console.WriteLine("──────── 缓存统计 ────────");
+        Console.WriteLine($"  {cache.Stats()}");
+    }
 }

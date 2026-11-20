@@ -30,6 +30,9 @@ namespace HelloLlm
         private readonly string _userId;
         private readonly string _department;
 
+        // 缓存：为 null 表示不启用。启用后每次提问先查，命中就不调模型。
+        private readonly LlmCache? _cache;
+
         /// <summary>
         /// 工具列表。放在字段里，手写循环和 BuildOptions 共用同一份实例。
         /// </summary>
@@ -100,7 +103,7 @@ namespace HelloLlm
                 OnClosed = args => { Console.WriteLine("[circuit] 关闭"); return default; },
             })
             // 单次：一次调用最多 15 秒。放最内层，防止某一次卡死。
-            .AddTimeout(TimeSpan.FromSeconds(10))
+            .AddTimeout(TimeSpan.FromSeconds(30))
             .Build();
 
         /// <summary>
@@ -112,13 +115,15 @@ namespace HelloLlm
         /// </summary>
         public LlmService(IChatClient chatClient, CostCalculator? cost = null,
                           UsageStore? usageStore = null,
-                          string userId = "anonymous", string department = "unknown")
+                          string userId = "anonymous", string department = "unknown",
+                          LlmCache? cache = null)
         {
             
             _rawClient = chatClient;
             _usageStore = usageStore;
             _userId = userId;
             _department = department;
+            _cache = cache;
 
             _tools =
             [
@@ -182,9 +187,41 @@ namespace HelloLlm
             // 钱花了，账没记，这是计费系统最典型的漏洞。
             var usage = new UsageAccumulator();
 
+            // 缓存 key 只取用户问题，不含 system prompt。
+            // 因为语义缓存算的是「问题像不像」，掺进一大段固定人设会把所有问题的向量拉得更接近。
+            // 代价：改了 system prompt 必须手动清缓存（LlmCache.ClearAsync）。
+            var userQuestion = messages.LastOrDefault(m => m.Role == LlmRole.User)?.Content ?? "";
+
+            if (_cache is not null && userQuestion.Length > 0)
+            {
+                var hit = await _cache.LookupAsync(userQuestion);
+                if (hit is not null)
+                {
+                    Console.WriteLine(hit.Kind == "exact"
+                        ? "[cache] 精确命中（一字不差）"
+                        : $"[cache] 语义命中（相似度 {hit.Score:F4}）");
+
+                    var cached = new LlmReply
+                    {
+                        Text = hit.Answer,
+                        IsCacheHit = true,
+                        CacheKind = hit.Kind,
+                        ElapsedMs = sw.ElapsedMilliseconds,
+                    };
+                    RecordUsage(requestId, cached, sw.ElapsedMilliseconds);
+                    return cached;
+                }
+            }
+
             try
             {
                 var reply = await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
+
+                // 只缓存模型真正生成的答案。降级答案是「服务不可用」的兜底，
+                // 缓存它等于把这个临时状态固化 24 小时，比不缓存更糟。
+                if (_cache is not null && !reply.IsFallback && userQuestion.Length > 0)
+                    await _cache.StoreAsync(userQuestion, reply.Text);
+
                 RecordUsage(requestId, reply, sw.ElapsedMilliseconds);
                 return reply;
             }
@@ -193,16 +230,15 @@ namespace HelloLlm
                 // 降级：服务不可用时用规则兜底，不把异常抛给用户。
                 // 只兜「服务挂了」这一类。参数错误、代码 bug 要照常抛 ——
                 // 否则自己的 bug 会被规则悄悄盖住，永远发现不了。
-                var question = "订单 A20261109 什么状态";
                 Console.WriteLine($"[degrade] {ex.GetType().Name}: {ex.Message}");
-                Console.WriteLine($"[degrade] 走规则兜底，问题：{question}");
+                Console.WriteLine($"[degrade] 走规则兜底，问题：{userQuestion}");
                 Console.WriteLine(usage.IsEmpty
                     ? "[degrade] 没有产生 token 消耗（请求没真正发出去）"
                     : $"[degrade] 但已经花掉 输入 {usage.Input} / 输出 {usage.Output} token，照记");
 
                 var fallbackReply = new LlmReply
                 {
-                    Text = RuleBasedAnswer(question),
+                    Text = RuleBasedAnswer(userQuestion),
                     IsFallback = true,
                     ElapsedMs = sw.ElapsedMilliseconds,
 
