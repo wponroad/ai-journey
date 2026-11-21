@@ -4,8 +4,18 @@ using Microsoft.Extensions.Configuration;
 using OpenAI;
 using System.ClientModel;
 using System.Text;
+using OpenTelemetry;
+using OpenTelemetry.Trace;
 
 Console.OutputEncoding = Encoding.UTF8;
+
+// OTel：把埋好的 Activity 导出到控制台。
+// AddSource 的名字必须和 ActivitySource("HelloLlm") 完全一致 ——
+// 写错了不会报错，只是一条都收不到，这种问题最容易查半天。
+using var tracerProvider = Sdk.CreateTracerProviderBuilder()
+    .AddSource("HelloLlm")
+    .AddConsoleExporter()
+    .Build();
 
 var config = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
@@ -87,6 +97,13 @@ using (IChatClient chat = failTimes > 0
         {
             var embedClient = new EmbeddingClient(options.BaseUrl, cacheOptions.EmbeddingModel);
             cache = new LlmCache(cacheOptions.Redis, embedClient, cacheOptions.Threshold, cacheOptions.TtlMinutes);
+
+            // 预热：bge-m3 有 1.2GB，第一次 embedding 要加载权重（实测 5 秒多）。
+            // 放在启动时做，别让第一个用户等这几秒 —— 这就是「冷启动」的代价，
+            // 线上服务通常还会配一个定时任务保活，防止进程闲置后又冷掉。
+            var warmSw = System.Diagnostics.Stopwatch.StartNew();
+            await embedClient.EmbedAsync("warmup");
+            Console.WriteLine($"缓存     模型预热完成（{warmSw.ElapsedMilliseconds} ms）");
         }
         catch (Exception ex)
         {

@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.AI;
+using OpenTelemetry.Resources;
 using Polly;
 using Polly.CircuitBreaker;
 using Polly.Retry;
@@ -105,7 +106,7 @@ namespace HelloLlm
             // 单次：一次调用最多 15 秒。放最内层，防止某一次卡死。
             .AddTimeout(TimeSpan.FromSeconds(30))
             .Build();
-
+        private static readonly ActivitySource _source = new("HelloLlm", "1.0.0");
         /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
         /// 价格从外面递进来，服务自己不读配置 —— 和 IChatClient 一样的道理。
@@ -179,88 +180,105 @@ namespace HelloLlm
                                                       int maxSteps = 5, Action<string>? trace = null,
                                                       Action<IReadOnlyList<ToolCallTrace>>? onCalls = null)
         {
-            var requestId = NewRequestId();
-            var sw = Stopwatch.StartNew();
-
-            // 用量累加器放在外层：失败时它里面还存着「前面几轮已经花掉的钱」。
-            // 如果它只是 core 里的局部变量，异常一抛，这些数字就跟着变量一起没了 ——
-            // 钱花了，账没记，这是计费系统最典型的漏洞。
-            var usage = new UsageAccumulator();
-
-            // 缓存 key 只取用户问题，不含 system prompt。
-            // 因为语义缓存算的是「问题像不像」，掺进一大段固定人设会把所有问题的向量拉得更接近。
-            // 代价：改了 system prompt 必须手动清缓存（LlmCache.ClearAsync）。
-            var userQuestion = messages.LastOrDefault(m => m.Role == LlmRole.User)?.Content ?? "";
-
-            if (_cache is not null && userQuestion.Length > 0)
+            // 根 span：整个请求。里面的 llm.call / tool.xxx 都会自动挂到它下面，
+            // 因为 StartActivity 会看 AsyncLocal 里的「当前活动」当爹。
+            using (var activity = _source.StartActivity("chat.request"))
             {
-                var hit = await _cache.LookupAsync(userQuestion);
-                if (hit is not null)
-                {
-                    Console.WriteLine(hit.Kind == "exact"
-                        ? "[cache] 精确命中（一字不差）"
-                        : $"[cache] 语义命中（相似度 {hit.Score:F4}）");
+                activity?.SetTag("llm.user", _userId);
+                activity?.SetTag("llm.dept", _department);
 
-                    var cached = new LlmReply
+                var requestId = NewRequestId();
+                var sw = Stopwatch.StartNew();
+
+                // 用量累加器放在外层：失败时它里面还存着「前面几轮已经花掉的钱」。
+                // 如果它只是 core 里的局部变量，异常一抛，这些数字就跟着变量一起没了 ——
+                // 钱花了，账没记，这是计费系统最典型的漏洞。
+                var usage = new UsageAccumulator();
+
+                // 缓存 key 只取用户问题，不含 system prompt。
+                // 因为语义缓存算的是「问题像不像」，掺进一大段固定人设会把所有问题的向量拉得更接近。
+                // 代价：改了 system prompt 必须手动清缓存（LlmCache.ClearAsync）。
+                var userQuestion = messages.LastOrDefault(m => m.Role == LlmRole.User)?.Content ?? "";
+                activity?.SetTag("llm.question", userQuestion);
+
+                // 向量在这里算一次，无论命中与否都留着给后面的 StoreAsync 复用
+                float[]? queryVector = null;
+
+                if (_cache is not null && userQuestion.Length > 0)
+                {
+                    using var cacheSpan = _source.StartActivity("cache.lookup");
+                    var (hit, vector) = await _cache.LookupAsync(userQuestion);
+                    queryVector = vector;
+
+                    cacheSpan?.SetTag("cache.hit", hit is not null);
+                    cacheSpan?.SetTag("cache.kind", hit?.Kind);
+                    if (hit is not null)
                     {
-                        Text = hit.Answer,
-                        IsCacheHit = true,
-                        CacheKind = hit.Kind,
-                        ElapsedMs = sw.ElapsedMilliseconds,
-                    };
-                    RecordUsage(requestId, cached, sw.ElapsedMilliseconds);
-                    return cached;
+                        Console.WriteLine(hit.Kind == "exact"
+                            ? "[cache] 精确命中（一字不差）"
+                            : $"[cache] 语义命中（相似度 {hit.Score:F4}）");
+
+                        var cached = new LlmReply
+                        {
+                            Text = hit.Answer,
+                            IsCacheHit = true,
+                            CacheKind = hit.Kind,
+                            ElapsedMs = sw.ElapsedMilliseconds,
+                        };
+                        RecordUsage(requestId, cached, sw.ElapsedMilliseconds);
+                        return cached;
+                    }
                 }
-            }
 
-            try
-            {
-                var reply = await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
-
-                // 只缓存模型真正生成的答案。降级答案是「服务不可用」的兜底，
-                // 缓存它等于把这个临时状态固化 24 小时，比不缓存更糟。
-                if (_cache is not null && !reply.IsFallback && userQuestion.Length > 0)
-                    await _cache.StoreAsync(userQuestion, reply.Text);
-
-                RecordUsage(requestId, reply, sw.ElapsedMilliseconds);
-                return reply;
-            }
-            catch (Exception ex) when (IsServiceDown(ex))
-            {
-                // 降级：服务不可用时用规则兜底，不把异常抛给用户。
-                // 只兜「服务挂了」这一类。参数错误、代码 bug 要照常抛 ——
-                // 否则自己的 bug 会被规则悄悄盖住，永远发现不了。
-                Console.WriteLine($"[degrade] {ex.GetType().Name}: {ex.Message}");
-                Console.WriteLine($"[degrade] 走规则兜底，问题：{userQuestion}");
-                Console.WriteLine(usage.IsEmpty
-                    ? "[degrade] 没有产生 token 消耗（请求没真正发出去）"
-                    : $"[degrade] 但已经花掉 输入 {usage.Input} / 输出 {usage.Output} token，照记");
-
-                var fallbackReply = new LlmReply
+                try
                 {
-                    Text = RuleBasedAnswer(userQuestion),
-                    IsFallback = true,
-                    ElapsedMs = sw.ElapsedMilliseconds,
+                    var reply = await AskWithToolsCoreAsync(messages, settings, maxSteps, trace, onCalls, sw, usage);
 
-                    // 降级不等于免费。熔断短路那次确实零消耗（请求压根没发），
-                    // 但「第 2 轮超时」这种情况，第 1 轮的 token 是真金白银付过的。
-                    InputTokens = usage.IsEmpty ? null : usage.Input,
-                    OutputTokens = usage.IsEmpty ? null : usage.Output,
-                    CachedInputTokens = usage.IsEmpty ? null : usage.Cached,
-                    Amount = usage.IsEmpty ? null : CalcAmount(usage.Input, usage.Output, usage.Cached),
-                };
+                    // 只缓存模型真正生成的答案。降级答案是「服务不可用」的兜底，
+                    // 缓存它等于把这个临时状态固化 24 小时，比不缓存更糟。
+                if (_cache is not null && !reply.IsFallback && userQuestion.Length > 0)
+                    await _cache.StoreAsync(userQuestion, reply.Text, queryVector);
 
-                // Status 记成 fallback 而不是 ok ——
-                // 混在一起的话，降级率永远看不见，模型挂了三个月你都以为系统正常。
-                RecordUsage(requestId, fallbackReply, sw.ElapsedMilliseconds);
-                return fallbackReply;
-            }
-            catch (Exception ex)
-            {
-                // 不在 IsServiceDown 清单里的异常（自己的 bug、参数错），
-                // 也要留痕，但必须原样抛出去 —— 兜底会把它们藏起来。
-                RecordError(requestId, ex, sw.ElapsedMilliseconds);
-                throw;
+                    RecordUsage(requestId, reply, sw.ElapsedMilliseconds);
+                    return reply;
+                }
+                catch (Exception ex) when (IsServiceDown(ex))
+                {
+                    // 降级：服务不可用时用规则兜底，不把异常抛给用户。
+                    // 只兜「服务挂了」这一类。参数错误、代码 bug 要照常抛 ——
+                    // 否则自己的 bug 会被规则悄悄盖住，永远发现不了。
+                    Console.WriteLine($"[degrade] {ex.GetType().Name}: {ex.Message}");
+                    Console.WriteLine($"[degrade] 走规则兜底，问题：{userQuestion}");
+                    Console.WriteLine(usage.IsEmpty
+                        ? "[degrade] 没有产生 token 消耗（请求没真正发出去）"
+                        : $"[degrade] 但已经花掉 输入 {usage.Input} / 输出 {usage.Output} token，照记");
+
+                    var fallbackReply = new LlmReply
+                    {
+                        Text = RuleBasedAnswer(userQuestion),
+                        IsFallback = true,
+                        ElapsedMs = sw.ElapsedMilliseconds,
+
+                        // 降级不等于免费。熔断短路那次确实零消耗（请求压根没发），
+                        // 但「第 2 轮超时」这种情况，第 1 轮的 token 是真金白银付过的。
+                        InputTokens = usage.IsEmpty ? null : usage.Input,
+                        OutputTokens = usage.IsEmpty ? null : usage.Output,
+                        CachedInputTokens = usage.IsEmpty ? null : usage.Cached,
+                        Amount = usage.IsEmpty ? null : CalcAmount(usage.Input, usage.Output, usage.Cached),
+                    };
+
+                    // Status 记成 fallback 而不是 ok ——
+                    // 混在一起的话，降级率永远看不见，模型挂了三个月你都以为系统正常。
+                    RecordUsage(requestId, fallbackReply, sw.ElapsedMilliseconds);
+                    return fallbackReply;
+                }
+                catch (Exception ex)
+                {
+                    // 不在 IsServiceDown 清单里的异常（自己的 bug、参数错），
+                    // 也要留痕，但必须原样抛出去 —— 兜底会把它们藏起来。
+                    RecordError(requestId, ex, sw.ElapsedMilliseconds);
+                    throw;
+                }
             }
         }
 
@@ -281,12 +299,22 @@ namespace HelloLlm
 
             for (int step = 1; step <= maxSteps; step++)
             {
+                // 单次模型调用的 span。一次对话通常 2 个：一个请求工具，一个给最终回答。
+                // using var 的作用域是循环体，所以每轮各自结束。
+                using var llmSpan = _source.StartActivity("llm.call");
+                llmSpan?.SetTag("llm.step", step);
+
+                var stepSw = Stopwatch.StartNew();
                 // 重试包在循环体里，只管单次调用。
                 // 不能包住整个 for：第 2 轮失败时第 1 轮的工具已经执行过了，
                 // 重跑循环会再调一次 GetOrder —— 非幂等，真实系统里就是重复下单。
                 var response = await _pipeline.ExecuteAsync(
                     async ct => await _rawClient.GetResponseAsync(chatMessages, options, ct));
+                stepSw.Stop();
 
+                llmSpan?.SetTag("llm.duration_ms", stepSw.ElapsedMilliseconds);
+                llmSpan?.SetTag("llm.input_tokens", response.Usage?.InputTokenCount);
+                llmSpan?.SetTag("llm.output_tokens", response.Usage?.OutputTokenCount);
                 if (response.Usage is { } u)
                 {
                     usage.Input += u.InputTokenCount ?? 0;
@@ -304,7 +332,7 @@ namespace HelloLlm
                     .OfType<FunctionCallContent>()
                     .ToList();
 
-                trace?.Invoke($"[step {step}] messages={chatMessages.Count} " +
+                trace?.Invoke($"[step {step}] messages={chatMessages.Count} 耗时 {stepSw.ElapsedMilliseconds} ms | " +
                               $"输入={response.Usage?.InputTokenCount} token " +
                               $"调用={(calls.Count == 0 ? "无（给最终回答）" : string.Join(", ", calls.Select(c => c.Name)))}");
 
@@ -332,6 +360,10 @@ namespace HelloLlm
 
                 foreach (var call in calls)
                 {
+                    // 工具 span：挂在本次 llm.call 下面，因为它是在这一轮里被模型请求的
+                    using var toolSpan = _source.StartActivity($"tool.{call.Name}");
+                    toolSpan?.SetTag("tool.name", call.Name);
+
                     object? result;
                     try
                     {

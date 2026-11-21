@@ -82,14 +82,19 @@ namespace HelloLlm
             return true;
         }
 
-        /// <summary>查缓存。返回 null 表示未命中，该去调模型了。</summary>
-        public async Task<CacheHit?> LookupAsync(string question, CancellationToken ct = default)
+        /// <summary>
+        /// 查缓存。返回 (命中结果, 本次算出的查询向量)。
+        ///
+        /// 为什么要把向量一起返回：未命中之后调用方要写缓存，而写缓存需要同一句话的向量。
+        /// 不返回的话就得再 embed 一次 —— 同一句话算两遍，白花一次调用的时间和钱。
+        /// </summary>
+        public async Task<(CacheHit? Hit, float[]? QueryVector)> LookupAsync(string question, CancellationToken ct = default)
         {
             if (!IsCacheable(question, out var reason))
             {
                 Console.WriteLine($"[cache] 跳过：{reason}");
                 _skipped++;
-                return null;
+                return (null, null);
             }
 
             // ── 第一级：精确 ──
@@ -98,19 +103,21 @@ namespace HelloLlm
             if (exact.HasValue)
             {
                 _exactHit++;
-                return new CacheHit(exact!, "exact", 1.0, question);
+                // 精确命中走的是 KV，压根没算向量，也不需要 —— 调用方不会写缓存
+                return (new CacheHit(exact!, "exact", 1.0, question), null);
             }
 
             // ── 第二级：语义 ──
+            // 向量在这里算一次，无论后面命中与否都复用给 StoreAsync
+            var queryVec = await _embed.EmbedAsync(question, ct);
+            var queryEntities = ExtractEntities(question);
+
             var ids = await _db.SetMembersAsync(SemIndex);
             if (ids.Length == 0)
             {
                 _miss++;
-                return null;
+                return (null, queryVec);
             }
-
-            var queryVec = await _embed.EmbedAsync(question, ct);
-            var queryEntities = ExtractEntities(question);
 
             CacheHit? best = null;
             double bestScore = 0;
@@ -146,21 +153,23 @@ namespace HelloLlm
             if (best is not null && bestScore >= _threshold)
             {
                 _semanticHit++;
-                return best;
+                return (best, queryVec);
             }
 
             _miss++;
-            return null;
+            return (null, queryVec);
         }
 
-        /// <summary>写缓存。不该缓存的问题，写也不写 —— 否则下次就查出来了。</summary>
-        public async Task StoreAsync(string question, string answer, CancellationToken ct = default)
+        /// <param name="vector">调用方已经算好的向量，传进来就不重复算了</param>
+        public async Task StoreAsync(string question, string answer,
+                                     float[]? vector = null, CancellationToken ct = default)
         {
             if (!IsCacheable(question, out _)) return;
 
             await _db.StringSetAsync(ExactPrefix + Hash(question), answer, _ttl);
 
-            var vec = await _embed.EmbedAsync(question, ct);
+            // 复用 LookupAsync 算过的向量；只有调用方没给才自己算
+            var vec = vector ?? await _embed.EmbedAsync(question, ct);
             var id = Hash(question);                    // 和精确 key 同源，一个问题只存一份向量
 
             await _db.HashSetAsync(SemPrefix + id,
