@@ -44,68 +44,8 @@ namespace HelloLlm
         /// 一是两条路径（AskAsync / AskWithToolsAsync）共用同一份，不会出现「改了一条忘另一条」；
         /// 二是策略属于配置，不是每次调用的产物。
         /// </summary>
-        private readonly ResiliencePipeline _pipeline = new ResiliencePipelineBuilder()
-            // 降级没有放在这里。Polly 的 AddFallback 拿不到用户原始的问题，
-            // 而规则兜底必须先知道「问了什么」。所以降级写在 AskWithToolsAsync
-            // 外层的 try/catch 里 —— 策略层管「失败了怎么办」，业务层管「给用户什么」。
-            // 总时长：含重试在内最多 30 秒。必须放最外层 ——
-            // 放内层的话它只管单次，重试 4 次就是 4 × 30 秒，封不住用户等待时间。
-            .AddTimeout(TimeSpan.FromSeconds(100))
-            .AddRetry(new RetryStrategyOptions
-            {
-                // 只对「可能自己好」的故障重试。4xx 一律不重试 —— 401 key 无效、
-                // 400 参数错，重试一百次还是错，只是多花几笔钱。
-                ShouldHandle = new PredicateBuilder()
-                    .Handle<HttpRequestException>(ex => ex.StatusCode is
-                        HttpStatusCode.RequestTimeout or
-                        HttpStatusCode.TooManyRequests or
-                        HttpStatusCode.InternalServerError or
-                        HttpStatusCode.BadGateway or
-                        HttpStatusCode.ServiceUnavailable or
-                        HttpStatusCode.GatewayTimeout)
-                .Handle<TimeoutRejectedException>()
-                    .Handle<TaskCanceledException>(),
-
-                MaxRetryAttempts = 4,                           // 总共执行 5 次（1 次原始 + 4 次重试）
-                Delay = TimeSpan.FromSeconds(1),
-                BackoffType = DelayBackoffType.Exponential,     // 1s → 2s → 4s
-                MaxDelay = TimeSpan.FromSeconds(10),            // 封顶，否则第 10 次要等 8 分钟
-                UseJitter = true,                               // 抖动：把重试时刻散开，避免重试风暴
-                //UseJitter = false,          // 关掉 Polly 的去相关抖动
-                //DelayGenerator = args =>    // 自己算：2^n 秒 + 0~300ms 随机
-                //    new ValueTask<TimeSpan?>(
-                //        TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber))
-                //        + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 300))),
-                OnRetry = args =>
-                {
-                    // AttemptNumber 是 0-based（第 0 次重试 = 第一次重试），+1 才是人话
-                    Console.WriteLine($"[retry {args.AttemptNumber + 1}] {args.Outcome.Exception?.Message}，" +
-                                      $"等 {args.RetryDelay.TotalSeconds:F1}s");
-                    return default;                             // 返回 ValueTask，不是 void
-                }
-            })
-            .AddCircuitBreaker(new CircuitBreakerStrategyOptions
-            {
-                FailureRatio = 0.5,                              // 失败率超一半
-                MinimumThroughput = 4,                           // 至少 4 次调用才判定
-                SamplingDuration = TimeSpan.FromSeconds(90),     // 统计窗口
-                BreakDuration = TimeSpan.FromSeconds(20),        // 打开后多久转半开
-                ShouldHandle = new PredicateBuilder()
-                    .Handle<HttpRequestException>(ex => ex.StatusCode is
-                        HttpStatusCode.RequestTimeout or
-                        HttpStatusCode.TooManyRequests or
-                        HttpStatusCode.InternalServerError or
-                        HttpStatusCode.BadGateway or
-                        HttpStatusCode.ServiceUnavailable or
-                        HttpStatusCode.GatewayTimeout)
-                        .Handle<TimeoutRejectedException>()
-                    .Handle<TaskCanceledException>(),
-                OnOpened = args => { Console.WriteLine("[circuit] 打开"); return default; },
-                OnClosed = args => { Console.WriteLine("[circuit] 关闭"); return default; },
-            })
-            // 单次：一次调用最多 15 秒。放最内层，防止某一次卡死。
-            .AddTimeout(TimeSpan.FromSeconds(30))
-            .Build();
+        // 重试策略在构造函数里构建，因为延迟要能在测试里改成毫秒级。
+        private readonly ResiliencePipeline _pipeline;
         private static readonly ActivitySource _source = new("HelloLlm", "1.0.0");
         /// <summary>
         /// cost 为 null 表示不算钱（比如这个配置节没配价格）。
@@ -117,8 +57,71 @@ namespace HelloLlm
         public LlmService(IChatClient chatClient, CostCalculator? cost = null,
                           UsageStore? usageStore = null,
                           string userId = "anonymous", string department = "unknown",
-                          LlmCache? cache = null)
+                          LlmCache? cache = null, TimeSpan? retryDelay = null)
         {
+            _pipeline = new ResiliencePipelineBuilder()
+                // 降级没有放在这里。Polly 的 AddFallback 拿不到用户原始的问题，
+                // 而规则兜底必须先知道「问了什么」。所以降级写在 AskWithToolsAsync
+                // 外层的 try/catch 里 —— 策略层管「失败了怎么办」，业务层管「给用户什么」。
+                // 总时长：含重试在内最多 30 秒。必须放最外层 ——
+                // 放内层的话它只管单次，重试 4 次就是 4 × 30 秒，封不住用户等待时间。
+                .AddTimeout(TimeSpan.FromSeconds(100))
+                .AddRetry(new RetryStrategyOptions
+                {
+                    // 只对「可能自己好」的故障重试。4xx 一律不重试 —— 401 key 无效、
+                    // 400 参数错，重试一百次还是错，只是多花几笔钱。
+                    ShouldHandle = new PredicateBuilder()
+                        .Handle<HttpRequestException>(ex => ex.StatusCode is
+                            HttpStatusCode.RequestTimeout or
+                            HttpStatusCode.TooManyRequests or
+                            HttpStatusCode.InternalServerError or
+                            HttpStatusCode.BadGateway or
+                            HttpStatusCode.ServiceUnavailable or
+                            HttpStatusCode.GatewayTimeout)
+                    .Handle<TimeoutRejectedException>()
+                        .Handle<TaskCanceledException>(),
+    
+                    MaxRetryAttempts = 4,                           // 总共执行 5 次（1 次原始 + 4 次重试）
+                    Delay = retryDelay ?? TimeSpan.FromSeconds(1),
+                    BackoffType = DelayBackoffType.Exponential,     // 1s → 2s → 4s
+                    MaxDelay = TimeSpan.FromSeconds(10),            // 封顶，否则第 10 次要等 8 分钟
+                    UseJitter = true,                               // 抖动：把重试时刻散开，避免重试风暴
+                    //UseJitter = false,          // 关掉 Polly 的去相关抖动
+                    //DelayGenerator = args =>    // 自己算：2^n 秒 + 0~300ms 随机
+                    //    new ValueTask<TimeSpan?>(
+                    //        TimeSpan.FromSeconds(Math.Pow(2, args.AttemptNumber))
+                    //        + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 300))),
+                    OnRetry = args =>
+                    {
+                        // AttemptNumber 是 0-based（第 0 次重试 = 第一次重试），+1 才是人话
+                        Console.WriteLine($"[retry {args.AttemptNumber + 1}] {args.Outcome.Exception?.Message}，" +
+                                          $"等 {args.RetryDelay.TotalSeconds:F1}s");
+                        return default;                             // 返回 ValueTask，不是 void
+                    }
+                })
+                .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+                {
+                    FailureRatio = 0.5,                              // 失败率超一半
+                    MinimumThroughput = 4,                           // 至少 4 次调用才判定
+                    SamplingDuration = TimeSpan.FromSeconds(90),     // 统计窗口
+                    BreakDuration = TimeSpan.FromSeconds(20),        // 打开后多久转半开
+                    ShouldHandle = new PredicateBuilder()
+                        .Handle<HttpRequestException>(ex => ex.StatusCode is
+                            HttpStatusCode.RequestTimeout or
+                            HttpStatusCode.TooManyRequests or
+                            HttpStatusCode.InternalServerError or
+                            HttpStatusCode.BadGateway or
+                            HttpStatusCode.ServiceUnavailable or
+                            HttpStatusCode.GatewayTimeout)
+                            .Handle<TimeoutRejectedException>()
+                        .Handle<TaskCanceledException>(),
+                    OnOpened = args => { Console.WriteLine("[circuit] 打开"); return default; },
+                    OnClosed = args => { Console.WriteLine("[circuit] 关闭"); return default; },
+                })
+                // 单次：一次调用最多 15 秒。放最内层，防止某一次卡死。
+                .AddTimeout(TimeSpan.FromSeconds(30))
+                .Build();
+
             
             _rawClient = chatClient;
             _usageStore = usageStore;
