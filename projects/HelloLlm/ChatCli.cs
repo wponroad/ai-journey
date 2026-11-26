@@ -1,4 +1,4 @@
-namespace HelloLlm
+﻿namespace HelloLlm
 {
     /// <summary>
     /// 控制台应用：菜单选择模式，两种模式共用同一个 AskOnce，

@@ -1,4 +1,4 @@
-namespace HelloLlm
+﻿namespace HelloLlm
 {
     /// <summary>
     /// 记账配置。单独一节，不和 ModelOptions 混在一起 ——

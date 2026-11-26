@@ -1,4 +1,4 @@
-@LlmGateway_HostAddress = http://localhost:5083
+﻿@LlmGateway_HostAddress = http://localhost:5083
 
 ### 健康检查（门槛 A 的第一步：这条通了才说明服务起来了）
 GET {{LlmGateway_HostAddress}}/health

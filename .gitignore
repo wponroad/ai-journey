@@ -13,7 +13,9 @@ artifacts/
 
 ## 配置与密钥（重要：绝不提交）
 appsettings.Development.json
-appsettings.Local.json
+# 用字符范围兼容大小写：Windows 上 git 忽略大小写，Linux/CI 上不忽略，
+# 只写 Local.json 的话在容器里构建时会把 local.json 漏进来。
+appsettings.[Ll]ocal.json
 .env
 *.env.local
 secrets.json

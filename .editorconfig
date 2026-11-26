@@ -1,0 +1,20 @@
+root = true
+
+# 全局规则：UTF-8 with BOM + CRLF
+# 这条不是风格偏好 —— VS 新建的 .cs / .csproj 默认就是 utf-8-bom + CRLF，
+# 保持一致的目的是让 git diff 不出现"整文件全改"的假变更。
+[*]
+charset = utf-8-bom
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,csproj,slnx,props,targets}]
+indent_size = 2
+
+# 纯文本文档不需要 BOM：某些 Markdown 渲染器会把 BOM 当成正文第一个字符。
+[*.md]
+charset = utf-8
+trim_trailing_whitespace = false
